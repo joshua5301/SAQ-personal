@@ -23,6 +23,10 @@ def get_qparser():
     parser.add_argument("--rho", type=float, default=0.1, help="rho in SAM")
     parser.add_argument("--eta", type=float, default=0.01, help="eta in ASAM")
     parser.add_argument("--kappa", type=float, default=0.1, help='kappa in FlipSAM')
+    # qconfig.py argparse
+    parser.add_argument("--kappa_mode", type=str, default="local",
+                    choices=["local", "global"],
+                    help="FlipSAM flip budget: per-layer (local) or network-wide (global)")
     parser.add_argument(
         "--include_wclip",
         type=bool,

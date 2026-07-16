@@ -13,7 +13,7 @@ def get_minimizer(model, optimizer, args):
         # FlipSAM perturbs only the rounding decisions of quantized weights;
         # kappa is its single hyperparameter. rho / include_* are meaningless
         # here and are deliberately not forwarded.
-        minimizer = flipsam.FlipSAM(optimizer, model, kappa=args.kappa)
+        minimizer = flipsam.FlipSAM(optimizer, model, kappa=args.kappa, kappa_mode=args.kappa_mode)
     elif "QSAM" in args.opt_type:
         minimizer = qsam.QSAM(
             optimizer,
