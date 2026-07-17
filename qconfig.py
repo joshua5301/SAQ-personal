@@ -27,13 +27,14 @@ def get_qparser():
     parser.add_argument("--scale_mode", type=str, default='local',
                     choices=["local", "global"], help="Tilted-SAM kappa mode")
     parser.add_argument("--kappa", type=float, default=0.1, help='kappa in FlipSAM')
+    parser.add_argument("--rho_flip", type=float, default=0.0025,
+                    help="FlipQSAM latent flip budget per weight (bin units)")
     # qconfig.py argparse
     parser.add_argument("--kappa_mode", type=str, default="local",
                     choices=["local", "global"],
                     help="FlipSAM flip budget: per-layer (local) or network-wide (global)")
-    parser.add_argument(
-        "--perturb_continuous", type=str, default="none",
-        choices=["none", "clip", "clip_bias", "all"],
+    parser.add_argument("--perturb_continuous", type=str, default="none",
+        choices=["none", "clip", "clip_bias", "all", "qsam_default"],
         help="FlipSAM continuous-param perturbation with kappa-induced radius",
     )
     

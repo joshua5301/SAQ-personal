@@ -244,13 +244,16 @@ if __name__ == "__main__":
             train_sampler.set_epoch(epoch)
 
         # Warmup disables the adversarial perturbation. Which knob does that
-        # depends on the minimizer: rho for the SAM family, kappa for FlipSAM
-        # (which has no rho at all -- setting it would silently do nothing).
+        # depends on the minimizer: rho for the SAM family (incl. FlipQSAM's
+        # continuous-param radius), kappa for FlipSAM, rho_flip for
+        # FlipQSAM's weight flips. TiltedSR's beta has no warmup knob yet.
         warmup = epoch < args.bit_warmup_epochs
         if hasattr(minimizer, "rho"):
             minimizer.rho = 0 if warmup else args.rho
         if hasattr(minimizer, "kappa"):
             minimizer.kappa = 0 if warmup else args.kappa
+        if hasattr(minimizer, "rho_flip"):
+            minimizer.rho_flip = 0 if warmup else args.rho_flip
 
         # train for one epoch
         train_error, train_loss, train5_error = train(

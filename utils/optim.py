@@ -6,11 +6,20 @@ import utils.qsam as qsam
 import utils.sam as sam
 import utils.flipsam as flipsam
 import utils.tilted_sr as tilted_sr
+import utils.flipqsam as flipqsam
 
 
 def get_minimizer(model, optimizer, args):
     if "TiltedSR" in args.opt_type:
         minimizer = tilted_sr.TiltedSR(optimizer, model, beta=args.beta, scale_mode=args.scale_mode)
+    elif "FlipQSAM" in args.opt_type:
+        minimizer = flipqsam.FlipQSAM(
+            optimizer,
+            model,
+            rho_flip=args.rho_flip,
+            rho=args.rho,
+            perturb_continuous=args.perturb_continuous,
+        )
     elif "FlipSAM" in args.opt_type:
         minimizer = flipsam.FlipSAM(optimizer, model, kappa=args.kappa, kappa_mode=args.kappa_mode, perturb_continuous="all")
     elif "QSAM" in args.opt_type:

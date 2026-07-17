@@ -79,13 +79,25 @@ def train(
         # descent step
         model.require_backward_grad_sync = True
         model.require_forward_param_sync = False
-        if "QSAM" in args.opt_type or "QASAM" in args.opt_type or "FlipSAM" in args.opt_type:
+        if (
+            "QSAM" in args.opt_type
+            or "QASAM" in args.opt_type
+            or "FlipSAM" in args.opt_type
+            or "FlipQSAM" in args.opt_type
+            or "TiltedSR" in args.opt_type
+        ):
             set_second_forward(model)
         disable_running_stats(model)
         criterion(model(image), target).backward()
         # torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         minimizer.descent_step()
-        if "QSAM" in args.opt_type or "QASAM" in args.opt_type or "FlipSAM" in args.opt_type:
+        if (
+            "QSAM" in args.opt_type
+            or "QASAM" in args.opt_type
+            or "FlipSAM" in args.opt_type
+            or "FlipQSAM" in args.opt_type
+            or "TiltedSR" in args.opt_type
+        ):
             set_first_forward(model)
 
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
