@@ -35,7 +35,11 @@ def get_qparser():
                     help="FlipSAM flip budget: per-layer (local) or network-wide (global)")
     parser.add_argument("--perturb_continuous", type=str, default="none",
         choices=["none", "clip", "clip_bias", "all", "qsam_default"],
-        help="FlipSAM continuous-param perturbation with kappa-induced radius",
+        help="FlipSAM/FlipQSAM continuous-param perturbation scope",
+    )
+    parser.add_argument("--cont_radius", type=str, default="induced",
+        choices=["induced", "qsam"],
+        help="FlipSAM continuous-param radius: kappa-induced, or QSAM-identical global norm + independent rho",
     )
     
     parser.add_argument(

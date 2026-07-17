@@ -21,7 +21,15 @@ def get_minimizer(model, optimizer, args):
             perturb_continuous=args.perturb_continuous,
         )
     elif "FlipSAM" in args.opt_type:
-        minimizer = flipsam.FlipSAM(optimizer, model, kappa=args.kappa, kappa_mode=args.kappa_mode, perturb_continuous="all")
+        minimizer = flipsam.FlipSAM(
+            optimizer,
+            model,
+            kappa=args.kappa,
+            kappa_mode=args.kappa_mode,
+            perturb_continuous=args.perturb_continuous,
+            cont_radius=args.cont_radius,
+            rho=args.rho,
+        )
     elif "QSAM" in args.opt_type:
         minimizer = qsam.QSAM(
             optimizer,

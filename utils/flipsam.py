@@ -12,38 +12,48 @@ class FlipSAM:
 
     Quantized weights are perturbed by discrete rounding flips (top-k% by
     first-order flip gain). Continuous parameters (clip values, bias, BN)
-    are perturbed in the gradient direction with a radius INHERITED from
-    the flip perturbation — no separate rho:
+    are perturbed in the gradient direction with a radius controlled by
+    cont_radius:
 
-        r_l      = ||eps_flip^(l)||_2 / ||Q(w^(l))||_2      (per layer)
-        r_global = sqrt(sum_l ||eps_flip^(l)||^2) / sqrt(sum_l ||Q(w^(l))||^2)
+        cont_radius == "induced" (default) -> radius INHERITED from the
+        flip perturbation, no separate rho:
+            r_l      = ||eps_flip^(l)||_2 / ||Q(w^(l))||_2      (per layer)
+            r_global = sqrt(sum_l ||eps_flip^(l)||^2) / sqrt(sum_l ||Q(w^(l))||^2)
+            e_p = r * ||p|| * grad_p / ||grad_p||
 
-        e_p = r * ||p|| * grad_p / ||grad_p||
+        cont_radius == "qsam" -> QSAM-identical global norm (quantized
+        weight grads INCLUDED in the denominator) with an independent rho:
+            e_p = rho * grad_p / ||[grad_w; grad_cont]||
 
-    Layer-attached params (clip, bias) use their layer's r_l; unattached
-    params (BN) use r_global. Single hyperparameter: kappa. kappa = 0
-    recovers the exact nearest-rounding QAT baseline (both perturbations
-    vanish).
+    Single hyperparameter for the flip side: kappa. kappa = 0 recovers the
+    exact nearest-rounding QAT baseline (both perturbations vanish).
 
     perturb_continuous:
-        "none"       -> flip-only (previous behavior)
-        "clip"       -> + weight/activation clip values (grid robustness)
-        "clip_bias"  -> + bias
-        "all"        -> + BN affine params
+        "none"         -> flip-only (previous behavior)
+        "clip"         -> + weight/activation clip values (grid robustness)
+        "clip_bias"    -> + bias
+        "all"          -> + BN affine params
+        "qsam_default" -> + bias + BN affine params (matches QSAM's default
+                           include_bn=True scope; no clip values)
     """
 
-    _CONT_MODES = ("none", "clip", "clip_bias", "all")
+    _CONT_MODES = ("none", "clip", "clip_bias", "all", "qsam_default")
+    _RADIUS_MODES = ("induced", "qsam")
 
     def __init__(self, optimizer, model, kappa=0.01,
                  kappa_mode="local", perturb_continuous="none",
+                 cont_radius="induced", rho=0.05,
                  mask_grid_exact=True):
         assert kappa_mode in ("local", "global"), kappa_mode
         assert perturb_continuous in self._CONT_MODES, perturb_continuous
+        assert cont_radius in self._RADIUS_MODES, cont_radius
         self.optimizer = optimizer
         self.model = model
         self.kappa = kappa
         self.kappa_mode = kappa_mode
         self.perturb_continuous = perturb_continuous
+        self.cont_radius = cont_radius
+        self.rho = rho          # used only when cont_radius == "qsam"
         self.mask_grid_exact = mask_grid_exact
         self.flip_stats = {}
         # {param_tensor: backup_data}; single source of truth for restore
@@ -107,34 +117,36 @@ class FlipSAM:
     @torch.no_grad()
     def _apply_continuous(self, layer_r):
         """
-        Standard (unnormalized) SAM ascent on continuous params, with a
-        SINGLE global radius induced from the flip perturbation:
+        SAM ascent on continuous params. Two radius modes:
 
-            r_global = sqrt(sum_l ||eps_flip||^2) / sqrt(sum_l ||Q(w)||^2)
-            rho      = r_global * ||p_cont||          (p_cont = all continuous params)
-            e_p      = rho * grad_p / ||grad_cont||    (one global grad norm)
+            cont_radius == "induced" (default): radius inherited from the
+            flip perturbation, no separate rho:
+                r_global = sqrt(sum_l ||eps_flip||^2) / sqrt(sum_l ||Q(w)||^2)
+                rho      = r_global * ||p_cont||
+                e_p      = rho * grad_p / ||grad_cont||
+
+            cont_radius == "qsam": QSAM-identical global norm (quantized
+            weight grads INCLUDED in the denominator) with an independent
+            rho, so the continuous treatment is bit-identical to QSAM:
+                e_p = rho * grad_p / ||[grad_w; grad_cont]||
         """
         mode = self.perturb_continuous
         if mode == "none":
             return
 
-        # relative perturbation ratio induced by the flips
-        tot_eps_sq = sum(v["eps_sq"] for v in layer_r.values())
-        tot_w_sq = sum(v["w_sq"] for v in layer_r.values())
-        r_global = (tot_eps_sq ** 0.5) / max(tot_w_sq ** 0.5, 1e-12)
-
-        # gather the continuous parameter set for this mode
+        # ---- gather continuous params by scope ----
         params = []
         for m, _ in layer_r.items():
-            for p in (m.weight_clip_value,
-                      getattr(m, "activation_clip_value", None)):
-                if p is not None and p.grad is not None:
-                    params.append(p)
-            if mode in ("clip_bias", "all"):
+            if mode in ("clip", "clip_bias", "all"):
+                for p in (m.weight_clip_value,
+                          getattr(m, "activation_clip_value", None)):
+                    if p is not None and p.grad is not None:
+                        params.append(p)
+            if mode in ("clip_bias", "all", "qsam_default"):
                 b = getattr(m, "bias", None)
                 if b is not None and b.grad is not None:
                     params.append(b)
-        if mode == "all":
+        if mode in ("all", "qsam_default"):
             for _, m in self.model.named_modules():
                 if isinstance(m, nn.BatchNorm2d) and m.weight is not None:
                     for p in (m.weight, m.bias):
@@ -143,17 +155,30 @@ class FlipSAM:
         if not params:
             return
 
-        # single global grad norm and single absolute radius
-        grad_norm = torch.norm(
-            torch.stack([p.grad.norm(p=2) for p in params]), p=2
-        )
-        if grad_norm <= 1e-12:
-            return
-        p_cont_norm = torch.norm(
-            torch.stack([p.data.norm(p=2) for p in params]), p=2
-        )
-        rho = r_global * p_cont_norm
-        scale = rho / grad_norm            # same scale for ALL params
+        cont_grad_sq = sum(float(p.grad.norm(p=2) ** 2) for p in params)
+
+        # ---- radius / scale branch ----
+        if self.cont_radius == "qsam":
+            # QSAM-identical: global norm INCLUDES quantized weight grads,
+            # independent rho (inherit SAQ's tuned value)
+            w_grad_sq = sum(
+                float(m.x.grad.norm(p=2) ** 2)
+                for m in layer_r if m.x.grad is not None
+            )
+            grad_norm = (w_grad_sq + cont_grad_sq) ** 0.5
+            scale = self.rho / (grad_norm + 1e-12)
+        else:
+            # induced: radius inherited from flip perturbation (no rho knob)
+            tot_eps_sq = sum(v["eps_sq"] for v in layer_r.values())
+            tot_w_sq = sum(v["w_sq"] for v in layer_r.values())
+            r_global = (tot_eps_sq ** 0.5) / max(tot_w_sq ** 0.5, 1e-12)
+            grad_norm = cont_grad_sq ** 0.5
+            if grad_norm <= 1e-12:
+                return
+            p_cont_norm = torch.norm(
+                torch.stack([p.data.norm(p=2) for p in params]), p=2
+            )
+            scale = float(r_global * p_cont_norm) / grad_norm
 
         for p in params:
             self._backups[p] = p.data.clone()
