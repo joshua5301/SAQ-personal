@@ -105,43 +105,59 @@ class FlipSAM:
     # ------------------------------------------------------------------ #
 
     @torch.no_grad()
-    def _perturb_param(self, p, r):
-        """Perturb p in-place: e = r * ||p|| * g/||g||. Backs up first."""
-        if p is None or p.grad is None or r <= 0:
-            return
-        gnorm = p.grad.norm(p=2)
-        if gnorm <= 1e-12:
-            return
-        self._backups[p] = p.data.clone()
-        p.add_(p.grad * (r * p.data.norm(p=2) / gnorm))
-
-    @torch.no_grad()
     def _apply_continuous(self, layer_r):
         """
-        layer_r: {module: r_l}. BN and other unattached params use r_global,
-        computed from the accumulated flip/weight norms.
+        Standard (unnormalized) SAM ascent on continuous params, with a
+        SINGLE global radius induced from the flip perturbation:
+
+            r_global = sqrt(sum_l ||eps_flip||^2) / sqrt(sum_l ||Q(w)||^2)
+            rho      = r_global * ||p_cont||          (p_cont = all continuous params)
+            e_p      = rho * grad_p / ||grad_cont||    (one global grad norm)
         """
         mode = self.perturb_continuous
         if mode == "none":
             return
 
-        # global radius for unattached params
+        # relative perturbation ratio induced by the flips
         tot_eps_sq = sum(v["eps_sq"] for v in layer_r.values())
         tot_w_sq = sum(v["w_sq"] for v in layer_r.values())
         r_global = (tot_eps_sq ** 0.5) / max(tot_w_sq ** 0.5, 1e-12)
 
-        for m, v in layer_r.items():
-            r_l = (v["eps_sq"] ** 0.5) / max(v["w_sq"] ** 0.5, 1e-12)
-            self._perturb_param(m.weight_clip_value, r_l)
-            self._perturb_param(getattr(m, "activation_clip_value", None), r_l)
+        # gather the continuous parameter set for this mode
+        params = []
+        for m, _ in layer_r.items():
+            for p in (m.weight_clip_value,
+                      getattr(m, "activation_clip_value", None)):
+                if p is not None and p.grad is not None:
+                    params.append(p)
             if mode in ("clip_bias", "all"):
-                self._perturb_param(getattr(m, "bias", None), r_l)
-
+                b = getattr(m, "bias", None)
+                if b is not None and b.grad is not None:
+                    params.append(b)
         if mode == "all":
             for _, m in self.model.named_modules():
                 if isinstance(m, nn.BatchNorm2d) and m.weight is not None:
-                    self._perturb_param(m.weight, r_global)
-                    self._perturb_param(m.bias, r_global)
+                    for p in (m.weight, m.bias):
+                        if p.grad is not None:
+                            params.append(p)
+        if not params:
+            return
+
+        # single global grad norm and single absolute radius
+        grad_norm = torch.norm(
+            torch.stack([p.grad.norm(p=2) for p in params]), p=2
+        )
+        if grad_norm <= 1e-12:
+            return
+        p_cont_norm = torch.norm(
+            torch.stack([p.data.norm(p=2) for p in params]), p=2
+        )
+        rho = r_global * p_cont_norm
+        scale = rho / grad_norm            # same scale for ALL params
+
+        for p in params:
+            self._backups[p] = p.data.clone()
+            p.add_(p.grad * scale)
 
     # ------------------------------------------------------------------ #
     # SAM interface
