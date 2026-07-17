@@ -24,11 +24,19 @@ def get_qparser():
     parser.add_argument("--eta", type=float, default=0.01, help="eta in ASAM")
     parser.add_argument("--beta", type=float, default=1.0,
                     help="TiltedSR tilt strength (0 = pure stochastic rounding)")
+    parser.add_argument("--scale_mode", type=str, default='local',
+                    choices=["local", "global"], help="Tilted-SAM kappa mode")
     parser.add_argument("--kappa", type=float, default=0.1, help='kappa in FlipSAM')
     # qconfig.py argparse
     parser.add_argument("--kappa_mode", type=str, default="local",
                     choices=["local", "global"],
                     help="FlipSAM flip budget: per-layer (local) or network-wide (global)")
+    parser.add_argument(
+        "--perturb_continuous", type=str, default="none",
+        choices=["none", "clip", "clip_bias", "all"],
+        help="FlipSAM continuous-param perturbation with kappa-induced radius",
+    )
+    
     parser.add_argument(
         "--include_wclip",
         type=bool,

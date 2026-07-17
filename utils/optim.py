@@ -10,9 +10,9 @@ import utils.tilted_sr as tilted_sr
 
 def get_minimizer(model, optimizer, args):
     if "TiltedSR" in args.opt_type:
-        minimizer = tilted_sr.TiltedSR(optimizer, model, beta=args.beta)
+        minimizer = tilted_sr.TiltedSR(optimizer, model, beta=args.beta, scale_mode=args.scale_mode)
     elif "FlipSAM" in args.opt_type:
-        minimizer = flipsam.FlipSAM(optimizer, model, kappa=args.kappa, kappa_mode=args.kappa_mode)
+        minimizer = flipsam.FlipSAM(optimizer, model, kappa=args.kappa, kappa_mode=args.kappa_mode, perturb_continuous="all")
     elif "QSAM" in args.opt_type:
         minimizer = qsam.QSAM(
             optimizer,

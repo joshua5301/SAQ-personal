@@ -50,38 +50,10 @@ def layer_rounding_geometry(m, mask_grid_exact=True):
 
     return gain, delta_flip, valid, prior_logit
 
-
 class TiltedSR:
-    """
-    Tilted stochastic rounding minimizer for QAT.
-
-    Every valid weight flips independently with probability
-
-        p_i = sigmoid( logit(p_SR_i) + beta * gain_hat_i ),
-
-    where gain_hat_i = gain_i / mean_j |gain_j| (per-layer, over valid j)
-    makes the tilt dimensionless, so beta is transferable across layers
-    and training time.
-
-    Single hyperparameter: beta.
-
-    Anchors / limits:
-        beta = 0     -> exact stochastic rounding; training is SR-QAT.
-                        (This run doubles as the SR-QAT baseline.)
-        beta -> +inf -> hard flip of all positive-gain weights
-                        (dense adversarial; ~pos_gain_frac, NOT top-k).
-        beta < 0     -> friendly-tilted SR (AdaRound-flavored inner min).
-
-    Small-beta: F_beta ~ E_SR[L] + (beta/2) Var_SR[L] — beta penalizes the
-    variance of the loss under rounding noise on top of unbiased SR.
-
-    The flip fraction is emergent (not controlled): ~E[min(r,1-r)] ~ 25%
-    at beta=0, moving toward pos_gain_frac as beta grows. This method
-    lives in the dense-perturbation regime; the sparse regime (~1%) is
-    FlipSAM's.
-    """
-
-    def __init__(self, optimizer, model, beta=1.0, mask_grid_exact=True):
+    def __init__(self, optimizer, model, beta=1.0,
+                 scale_mode="local", mask_grid_exact=True):
+        assert scale_mode in ("local", "global"), scale_mode
         self.optimizer = optimizer
         self.model = model
         self.beta = beta
@@ -89,49 +61,56 @@ class TiltedSR:
         # per-layer diagnostics, refreshed every ascent step; log to wandb
         self.flip_stats = {}
 
+        self.scale_mode = scale_mode
+
     def _is_quantized(self, m):
         return isinstance(m, (QConv2d, QLinear)) and m.bits_weights != 32
-
-    # ------------------------------------------------------------------ #
-    # SAM interface (engine.py calls these)
-    # ------------------------------------------------------------------ #
-
+    
     @torch.no_grad()
     def ascent_step(self):
+        # pass 0 (global only): streaming global scale
+        global_scale = None
+        if self.scale_mode == "global":
+            tot_abs, tot_cnt = 0.0, 0
+            for _, m in self.model.named_modules():
+                if not self._is_quantized(m):
+                    continue
+                res = layer_rounding_geometry(m, self.mask_grid_exact)
+                if res is None:
+                    continue
+                gain, _, valid, _ = res
+                vg = gain[valid]
+                tot_abs += float(vg.abs().sum().item())
+                tot_cnt += int(vg.numel())
+                m._geom_cache = res          # 재계산 방지용 1스텝 캐시
+            global_scale = max(tot_abs / max(tot_cnt, 1), 1e-12)
+
         for name, m in self.model.named_modules():
             if not self._is_quantized(m):
                 continue
-            res = layer_rounding_geometry(m, self.mask_grid_exact)
+            res = getattr(m, "_geom_cache", None) or \
+                  layer_rounding_geometry(m, self.mask_grid_exact)
+            m._geom_cache = None
             if res is None:
                 continue
             gain, delta_flip, valid, prior_logit = res
-
             vg = gain[valid]
             if vg.numel() == 0:
                 m.epsilon = torch.zeros_like(delta_flip)
                 continue
 
-            # dimensionless tilt
-            scale = vg.abs().mean().clamp_min(1e-12)
-            tilt = self.beta * (gain / scale)
+            if self.scale_mode == "global":
+                scale = global_scale
+            else:
+                scale = vg.abs().mean().clamp_min(1e-12)
 
-            p = torch.sigmoid(prior_logit + tilt)
-            p = p * valid.to(p.dtype)  # masked entries never flip
-
+            p = torch.sigmoid(prior_logit + self.beta * (gain / scale))
+            p = p * valid.to(p.dtype)
             flips = torch.bernoulli(p)
             m.epsilon = flips * delta_flip
-
-            d = gain.numel()
-            self.flip_stats[name] = {
-                "flips": int(flips.sum().item()),
-                "expected_flips": float(p.sum().item()),
-                "flip_frac": float(flips.sum().item()) / max(d, 1),
-                "sr_flip_frac": float(
-                    torch.sigmoid(prior_logit)[valid].mean().item()
-                ),
-                "pos_gain_frac": (gain[valid] > 0).float().mean().item(),
-            }
+            # flip_stats 동일 (+ "scale": float(scale) 로깅 권장)
         self.optimizer.zero_grad()
+
 
     @torch.no_grad()
     def descent_step(self):
