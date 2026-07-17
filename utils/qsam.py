@@ -36,7 +36,7 @@ class QSAM:
                     wgrads.append(
                         torch.norm(m.weight_clip_value.grad, p=2).to(shared_device)
                     )
-                if self.include_aclip and m.activation_clip_value.grad:
+                if self.include_aclip and m.activation_clip_value.grad is not None:
                     wgrads.append(
                         torch.norm(m.activation_clip_value.grad, p=2).to(shared_device)
                     )
@@ -69,7 +69,7 @@ class QSAM:
                     e_w = p.grad * scale.to(p)
                     p.add_(e_w)
 
-                if self.include_aclip and m.activation_clip_value.grad:
+                if self.include_aclip and m.activation_clip_value.grad is not None:
                     p = m.activation_clip_value
                     self.state[p]["old_p"] = p.data.clone()
                     e_w = p.grad * scale.to(p)
@@ -178,7 +178,7 @@ class QSAM:
                     p = m.weight_clip_value
                     p.data = self.state[p]["old_p"]
                     # m.weight_clip_value.sub_(self.state[m]["weight_clip_eps"])
-                if self.include_aclip and m.activation_clip_value.grad:
+                if self.include_aclip and m.activation_clip_value.grad is not None:
                     p = m.activation_clip_value
                     p.data = self.state[p]["old_p"]
 
@@ -223,7 +223,7 @@ class QSAM:
                     p = m.weight_clip_value
                     p.data = self.state[p]["old_p"]
                     # m.weight_clip_value.sub_(self.state[m]["weight_clip_eps"])
-                if self.include_aclip and m.activation_clip_value.grad:
+                if self.include_aclip and m.activation_clip_value.grad is not None:
                     p = m.activation_clip_value
                     p.data = self.state[p]["old_p"]
 

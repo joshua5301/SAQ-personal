@@ -11,7 +11,14 @@ import utils.flipqsam as flipqsam
 
 def get_minimizer(model, optimizer, args):
     if "TiltedSR" in args.opt_type:
-        minimizer = tilted_sr.TiltedSR(optimizer, model, beta=args.beta, scale_mode=args.scale_mode)
+        minimizer = tilted_sr.TiltedSR(
+            optimizer,
+            model,
+            beta=args.beta,
+            scale_mode=args.scale_mode,
+            perturb_continuous=args.perturb_continuous,
+            rho=args.rho,
+        )
     elif "FlipQSAM" in args.opt_type:
         minimizer = flipqsam.FlipQSAM(
             optimizer,

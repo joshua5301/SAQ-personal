@@ -8,6 +8,7 @@ rounding geometry via flipsam.layer_rounding_geometry.
 import torch
 
 from models.LIQ_wn_qsam import QConv2d, QLinear
+from utils.cont_perturb import CONT_MODES, gather_cont_params, apply_qsam_radius
 
 @torch.no_grad()
 def layer_rounding_geometry(m, mask_grid_exact=True):
@@ -52,14 +53,20 @@ def layer_rounding_geometry(m, mask_grid_exact=True):
 
 class TiltedSR:
     def __init__(self, optimizer, model, beta=1.0,
-                 scale_mode="local", mask_grid_exact=True):
+                 scale_mode="local", perturb_continuous="none",
+                 rho=0.05, mask_grid_exact=True):
         assert scale_mode in ("local", "global"), scale_mode
+        assert perturb_continuous in CONT_MODES, perturb_continuous
         self.optimizer = optimizer
         self.model = model
         self.beta = beta
+        self.perturb_continuous = perturb_continuous
+        self.rho = rho          # continuous SAM radius (QSAM-identical scale)
         self.mask_grid_exact = mask_grid_exact
         # per-layer diagnostics, refreshed every ascent step; log to wandb
         self.flip_stats = {}
+        # {param_tensor: backup_data}; single source of truth for restore
+        self._backups = {}
 
         self.scale_mode = scale_mode
 
@@ -68,6 +75,7 @@ class TiltedSR:
     
     @torch.no_grad()
     def ascent_step(self):
+        self._backups.clear()
         # pass 0 (global only): streaming global scale
         global_scale = None
         if self.scale_mode == "global":
@@ -109,16 +117,27 @@ class TiltedSR:
             flips = torch.bernoulli(p)
             m.epsilon = flips * delta_flip
             # flip_stats 동일 (+ "scale": float(scale) 로깅 권장)
+
+        # continuous params: same scope + QSAM-identical scale as the other
+        # minimizers, so comparison runs differ only in the weight perturbation
+        cont_params = gather_cont_params(self.model, self.perturb_continuous)
+        apply_qsam_radius(self.model, cont_params, self.rho, self._backups)
+
         self.optimizer.zero_grad()
 
+    @torch.no_grad()
+    def _restore(self):
+        for p, data in self._backups.items():
+            p.data = data
+        self._backups.clear()
 
     @torch.no_grad()
     def descent_step(self):
-        # No continuous perturbation to undo; clip/bias/BN are updated by
-        # the optimizer using the gradient from the tilted (second) pass.
+        self._restore()
         self.optimizer.step()
         self.optimizer.zero_grad()
 
     @torch.no_grad()
     def restore_step(self):
+        self._restore()
         self.optimizer.zero_grad()

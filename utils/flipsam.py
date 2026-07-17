@@ -1,8 +1,8 @@
 from collections import defaultdict
 
 import torch
-import torch.nn as nn
 from models.LIQ_wn_qsam import QConv2d, QLinear
+from utils.cont_perturb import CONT_MODES, gather_cont_params, apply_qsam_radius
 
 
 class FlipSAM:
@@ -33,11 +33,12 @@ class FlipSAM:
         "clip"         -> + weight/activation clip values (grid robustness)
         "clip_bias"    -> + bias
         "all"          -> + BN affine params
-        "qsam_default" -> + bias + BN affine params (matches QSAM's default
-                           include_bn=True scope; no clip values)
+        "qsam_default" -> activation clip + bias + BN affine — the QSAM
+                           baseline's default scope (include_aclip=True,
+                           include_bn=True, include_wclip=False)
     """
 
-    _CONT_MODES = ("none", "clip", "clip_bias", "all", "qsam_default")
+    _CONT_MODES = CONT_MODES
     _RADIUS_MODES = ("induced", "qsam")
 
     def __init__(self, optimizer, model, kappa=0.01,
@@ -134,51 +135,30 @@ class FlipSAM:
         if mode == "none":
             return
 
-        # ---- gather continuous params by scope ----
-        params = []
-        for m, _ in layer_r.items():
-            if mode in ("clip", "clip_bias", "all"):
-                for p in (m.weight_clip_value,
-                          getattr(m, "activation_clip_value", None)):
-                    if p is not None and p.grad is not None:
-                        params.append(p)
-            if mode in ("clip_bias", "all", "qsam_default"):
-                b = getattr(m, "bias", None)
-                if b is not None and b.grad is not None:
-                    params.append(b)
-        if mode in ("all", "qsam_default"):
-            for _, m in self.model.named_modules():
-                if isinstance(m, nn.BatchNorm2d) and m.weight is not None:
-                    for p in (m.weight, m.bias):
-                        if p.grad is not None:
-                            params.append(p)
+        # shared gather so every minimizer perturbs the identical param set
+        params = gather_cont_params(self.model, mode)
         if not params:
             return
 
-        cont_grad_sq = sum(float(p.grad.norm(p=2) ** 2) for p in params)
-
-        # ---- radius / scale branch ----
         if self.cont_radius == "qsam":
             # QSAM-identical: global norm INCLUDES quantized weight grads,
             # independent rho (inherit SAQ's tuned value)
-            w_grad_sq = sum(
-                float(m.x.grad.norm(p=2) ** 2)
-                for m in layer_r if m.x.grad is not None
-            )
-            grad_norm = (w_grad_sq + cont_grad_sq) ** 0.5
-            scale = self.rho / (grad_norm + 1e-12)
-        else:
-            # induced: radius inherited from flip perturbation (no rho knob)
-            tot_eps_sq = sum(v["eps_sq"] for v in layer_r.values())
-            tot_w_sq = sum(v["w_sq"] for v in layer_r.values())
-            r_global = (tot_eps_sq ** 0.5) / max(tot_w_sq ** 0.5, 1e-12)
-            grad_norm = cont_grad_sq ** 0.5
-            if grad_norm <= 1e-12:
-                return
-            p_cont_norm = torch.norm(
-                torch.stack([p.data.norm(p=2) for p in params]), p=2
-            )
-            scale = float(r_global * p_cont_norm) / grad_norm
+            apply_qsam_radius(self.model, params, self.rho, self._backups)
+            return
+
+        # induced: radius inherited from flip perturbation (no rho knob)
+        tot_eps_sq = sum(v["eps_sq"] for v in layer_r.values())
+        tot_w_sq = sum(v["w_sq"] for v in layer_r.values())
+        r_global = (tot_eps_sq ** 0.5) / max(tot_w_sq ** 0.5, 1e-12)
+        grad_norm = torch.norm(
+            torch.stack([p.grad.norm(p=2) for p in params]), p=2
+        )
+        if grad_norm <= 1e-12:
+            return
+        p_cont_norm = torch.norm(
+            torch.stack([p.data.norm(p=2) for p in params]), p=2
+        )
+        scale = float(r_global * p_cont_norm) / float(grad_norm)
 
         for p in params:
             self._backups[p] = p.data.clone()

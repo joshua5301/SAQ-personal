@@ -19,13 +19,13 @@ Knobs:
 """
 
 import torch
-import torch.nn as nn
 from models.LIQ_wn_qsam import QConv2d, QLinear
+from utils.cont_perturb import CONT_MODES, gather_cont_params, apply_qsam_radius
 
 
 class FlipQSAM:
 
-    _CONT_MODES = ("none", "clip", "clip_bias", "all", "qsam_default")
+    _CONT_MODES = CONT_MODES
 
     def __init__(self, optimizer, model, rho_flip=0.0025, rho=0.05,
                  perturb_continuous="clip", mask_grid_exact=True):
@@ -108,33 +108,6 @@ class FlipQSAM:
     def ascent_step(self):
         self._backups.clear()
 
-        # ---- pass 1: global grad norm, QSAM-identical denominator ----
-        # (quantized weight grads INCLUDED, exactly as in QSAM)
-        cont_params = []
-        grad_norms = []
-        for _, m in self.model.named_modules():
-            if isinstance(m, (QConv2d, QLinear)):
-                if self._is_quantized(m) and m.x.grad is not None:
-                    grad_norms.append(m.x.grad.norm(p=2))
-                mode = self.perturb_continuous
-                if mode != "none":
-                    cands = []
-                    if mode in ("clip", "clip_bias", "all"):
-                        cands += [m.weight_clip_value,
-                                  getattr(m, "activation_clip_value", None)]
-                    if mode in ("clip_bias", "all", "qsam_default"):
-                        cands.append(getattr(m, "bias", None))
-                    for p in cands:
-                        if p is not None and p.grad is not None:
-                            cont_params.append(p)
-                            grad_norms.append(p.grad.norm(p=2))
-            if self.perturb_continuous in ("all", "qsam_default") and \
-                    isinstance(m, nn.BatchNorm2d) and m.weight is not None:
-                for p in (m.weight, m.bias):
-                    if p.grad is not None:
-                        cont_params.append(p)
-                        grad_norms.append(p.grad.norm(p=2))
-
         # ---- weights: knapsack flips, per-layer budget rho_flip * d ----
         for name, m in self.model.named_modules():
             if not self._is_quantized(m):
@@ -158,13 +131,10 @@ class FlipQSAM:
                 if valid.any() else 0.0,
             }
 
-        # ---- continuous params: standard SAM step, QSAM scale ----
-        if cont_params and grad_norms and self.rho > 0:
-            grad_norm = torch.norm(torch.stack(grad_norms), p=2)
-            scale = self.rho / (grad_norm + 1e-12)
-            for p in cont_params:
-                self._backups[p] = p.data.clone()
-                p.add_(p.grad * scale.to(p))
+        # ---- continuous params: QSAM-identical scope + scale ----
+        # (shared helper; quantized weight grads included in denominator)
+        cont_params = gather_cont_params(self.model, self.perturb_continuous)
+        apply_qsam_radius(self.model, cont_params, self.rho, self._backups)
 
         self.optimizer.zero_grad()
 
