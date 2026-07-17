@@ -70,7 +70,7 @@ def train(
         # Ascent Step
         model.require_backward_grad_sync = False
         model.require_forward_param_sync = True
-        # enable_running_stats(model)
+        enable_running_stats(model)
         output = model(image)
         loss = criterion(output, target)
         loss.backward()
@@ -81,7 +81,7 @@ def train(
         model.require_forward_param_sync = False
         if "QSAM" in args.opt_type or "QASAM" in args.opt_type or "FlipSAM" in args.opt_type:
             set_second_forward(model)
-        # disable_running_stats(model)
+        disable_running_stats(model)
         criterion(model(image), target).backward()
         # torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         minimizer.descent_step()
