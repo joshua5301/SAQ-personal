@@ -22,6 +22,8 @@ def get_qparser():
     parser.add_argument("--qa", type=float, default=8.0, help="activation bit")
     parser.add_argument("--rho", type=float, default=0.1, help="rho in SAM")
     parser.add_argument("--eta", type=float, default=0.01, help="eta in ASAM")
+    parser.add_argument("--beta", type=float, default=1.0,
+                    help="TiltedSR tilt strength (0 = pure stochastic rounding)")
     parser.add_argument("--kappa", type=float, default=0.1, help='kappa in FlipSAM')
     # qconfig.py argparse
     parser.add_argument("--kappa_mode", type=str, default="local",

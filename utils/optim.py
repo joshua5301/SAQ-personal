@@ -5,14 +5,13 @@ import utils.qasam as qasam
 import utils.qsam as qsam
 import utils.sam as sam
 import utils.flipsam as flipsam
+import utils.tilted_sr as tilted_sr
 
 
 def get_minimizer(model, optimizer, args):
-
-    if "FlipSAM" in args.opt_type:
-        # FlipSAM perturbs only the rounding decisions of quantized weights;
-        # kappa is its single hyperparameter. rho / include_* are meaningless
-        # here and are deliberately not forwarded.
+    if "TiltedSR" in args.opt_type:
+        minimizer = tilted_sr.TiltedSR(optimizer, model, beta=args.beta)
+    elif "FlipSAM" in args.opt_type:
         minimizer = flipsam.FlipSAM(optimizer, model, kappa=args.kappa, kappa_mode=args.kappa_mode)
     elif "QSAM" in args.opt_type:
         minimizer = qsam.QSAM(
