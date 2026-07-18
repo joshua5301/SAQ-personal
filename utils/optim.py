@@ -8,14 +8,25 @@ import utils.flipsam as flipsam
 import utils.tilted_sr as tilted_sr
 import utils.flipqsam as flipqsam
 import utils.kltilt as kltilt
+import utils.logitflip as logitflip
 
 
 def get_minimizer(model, optimizer, args):
-    if "KLTilt" in args.opt_type:
+    if "LogitFlip" in args.opt_type:
+        minimizer = logitflip.LogitFlip(
+            optimizer,
+            model,
+            tau=args.tau,
+            scope=args.flip_scope,
+            perturb_continuous=args.perturb_continuous,
+            rho=args.rho,
+        )
+    elif "KLTilt" in args.opt_type:
         minimizer = kltilt.KLTilt(
             optimizer,
             model,
             tau=args.tau,
+            deterministic=args.deterministic,
             perturb_continuous=args.perturb_continuous,
             rho=args.rho,
         )
@@ -25,6 +36,7 @@ def get_minimizer(model, optimizer, args):
             model,
             beta=args.beta,
             scale_mode=args.scale_mode,
+            deterministic=args.deterministic,
             perturb_continuous=args.perturb_continuous,
             rho=args.rho,
         )

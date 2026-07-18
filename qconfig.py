@@ -31,6 +31,13 @@ def get_qparser():
                     help="FlipQSAM latent flip budget per weight (bin units)")
     parser.add_argument("--tau", type=float, default=0.01,
                     help="KLTilt KL budget in nats per weight (0 = pure SR-QAT)")
+    parser.add_argument("--deterministic", type=bool, default=False,
+                    help="TiltedSR/KLTilt: take the MAP of the tilted "
+                         "distribution (b = [p > 0.5]) instead of sampling")
+    parser.add_argument("--flip_scope", type=str, default="global",
+                    choices=["local", "global"],
+                    help="LogitFlip budget scope: per-layer (local) or "
+                         "network-wide (global)")
     # qconfig.py argparse
     parser.add_argument("--kappa_mode", type=str, default="local",
                     choices=["local", "global"],

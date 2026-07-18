@@ -86,6 +86,7 @@ def train(
             or "FlipQSAM" in args.opt_type
             or "TiltedSR" in args.opt_type
             or "KLTilt" in args.opt_type
+            or "LogitFlip" in args.opt_type
         ):
             set_second_forward(model)
         disable_running_stats(model)
@@ -99,6 +100,7 @@ def train(
             or "FlipQSAM" in args.opt_type
             or "TiltedSR" in args.opt_type
             or "KLTilt" in args.opt_type
+            or "LogitFlip" in args.opt_type
         ):
             set_first_forward(model)
 

@@ -52,14 +52,26 @@ def layer_rounding_geometry(m, mask_grid_exact=True):
     return gain, delta_flip, valid, prior_logit
 
 class TiltedSR:
+    """
+    deterministic=False (default): sample flips from the tilted SR
+        distribution, b ~ Bernoulli(p). beta = 0 -> pure SR-QAT.
+    deterministic=True: MAP of the tilted distribution, b = [p > 0.5]
+        (flip only where the tilt pushes the flip probability past 1/2,
+        mirroring KLTilt's deterministic branch). Since the SR prior of
+        the flip side is always <= 1/2, beta = 0 -> exact nearest-rounding
+        QAT (no flips, epsilon == 0).
+    """
+
     def __init__(self, optimizer, model, beta=1.0,
-                 scale_mode="local", perturb_continuous="none",
+                 scale_mode="local", deterministic=False,
+                 perturb_continuous="none",
                  rho=0.05, mask_grid_exact=True):
         assert scale_mode in ("local", "global"), scale_mode
         assert perturb_continuous in CONT_MODES, perturb_continuous
         self.optimizer = optimizer
         self.model = model
         self.beta = beta
+        self.deterministic = deterministic
         self.perturb_continuous = perturb_continuous
         self.rho = rho          # continuous SAM radius (QSAM-identical scale)
         self.mask_grid_exact = mask_grid_exact
@@ -114,7 +126,11 @@ class TiltedSR:
 
             p = torch.sigmoid(prior_logit + self.beta * (gain / scale))
             p = p * valid.to(p.dtype)
-            flips = torch.bernoulli(p)
+            if self.deterministic:
+                # MAP of the tilted distribution; invalid coords have p = 0
+                flips = (p > 0.5).to(p.dtype)
+            else:
+                flips = torch.bernoulli(p)
             m.epsilon = flips * delta_flip
             # flip_stats 동일 (+ "scale": float(scale) 로깅 권장)
 
