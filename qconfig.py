@@ -31,6 +31,10 @@ def get_qparser():
                     help="FlipQSAM latent flip budget per weight (bin units)")
     parser.add_argument("--tau", type=float, default=0.01,
                     help="KLTilt KL budget in nats per weight (0 = pure SR-QAT)")
+    parser.add_argument("--space", type=str, default="output",
+                    choices=["output", "latent"],
+                    help="GridUSAM flip-cost space: output (|delta|) or "
+                         "latent (distance to rounding boundary)")
     parser.add_argument("--deterministic", type=bool, default=False,
                     help="TiltedSR/KLTilt: take the MAP of the tilted "
                          "distribution (b = [p > 0.5]) instead of sampling")

@@ -9,10 +9,19 @@ import utils.tilted_sr as tilted_sr
 import utils.flipqsam as flipqsam
 import utils.kltilt as kltilt
 import utils.logitflip as logitflip
+import utils.gridusam as gridusam
 
 
 def get_minimizer(model, optimizer, args):
-    if "LogitFlip" in args.opt_type:
+    if "GridUSAM" in args.opt_type:
+        minimizer = gridusam.GridUSAM(
+            optimizer,
+            model,
+            rho=args.rho,
+            space=args.space,
+            perturb_continuous=args.perturb_continuous,
+        )
+    elif "LogitFlip" in args.opt_type:
         minimizer = logitflip.LogitFlip(
             optimizer,
             model,
