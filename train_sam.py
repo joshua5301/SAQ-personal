@@ -254,6 +254,8 @@ if __name__ == "__main__":
             minimizer.kappa = 0 if warmup else args.kappa
         if hasattr(minimizer, "rho_flip"):
             minimizer.rho_flip = 0 if warmup else args.rho_flip
+        if hasattr(minimizer, "tau"):
+            minimizer.tau = 0 if warmup else args.tau
 
         # train for one epoch
         train_error, train_loss, train5_error = train(

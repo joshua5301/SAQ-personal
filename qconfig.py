@@ -29,6 +29,8 @@ def get_qparser():
     parser.add_argument("--kappa", type=float, default=0.1, help='kappa in FlipSAM')
     parser.add_argument("--rho_flip", type=float, default=0.0025,
                     help="FlipQSAM latent flip budget per weight (bin units)")
+    parser.add_argument("--tau", type=float, default=0.01,
+                    help="KLTilt KL budget in nats per weight (0 = pure SR-QAT)")
     # qconfig.py argparse
     parser.add_argument("--kappa_mode", type=str, default="local",
                     choices=["local", "global"],

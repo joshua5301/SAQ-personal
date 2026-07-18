@@ -7,10 +7,19 @@ import utils.sam as sam
 import utils.flipsam as flipsam
 import utils.tilted_sr as tilted_sr
 import utils.flipqsam as flipqsam
+import utils.kltilt as kltilt
 
 
 def get_minimizer(model, optimizer, args):
-    if "TiltedSR" in args.opt_type:
+    if "KLTilt" in args.opt_type:
+        minimizer = kltilt.KLTilt(
+            optimizer,
+            model,
+            tau=args.tau,
+            perturb_continuous=args.perturb_continuous,
+            rho=args.rho,
+        )
+    elif "TiltedSR" in args.opt_type:
         minimizer = tilted_sr.TiltedSR(
             optimizer,
             model,
