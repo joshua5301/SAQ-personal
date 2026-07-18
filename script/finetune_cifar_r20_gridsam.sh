@@ -1,0 +1,3 @@
+# Remember to replace the path of dataset, the path pretrained model, and the arch_bits
+# --arch_bits "5.0, 4.0, 2.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0"
+python train_sam.py --save_path ./output/cifar100/finetune/r20/ --data_path ./dataset/ --dataset cifar100 --lr 0.01 --clip_lr 0.01 --opt_type GridSAM_SGD --rho 0.9 --perturb_continuous qsam_default --network qsampreresnet20 --pretrained ./pretrained/cifar100_resnet.pth --qw 4.0 --qa 4.0 --quan_type LIQ_wn_qsam --experiment_id 01 --seed 1 --gpu 0
