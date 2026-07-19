@@ -79,6 +79,12 @@ def get_qparser():
         help="whether to include bn parameters in SAM",
     )
     parser.add_argument(
+        "--include_bias",
+        type=bool,
+        default=True,
+        help="whether to include conv/linear bias in QSAM",
+    )
+    parser.add_argument(
         "--grad_clip", type=float, default=5.0, help="maximum norm of gradient",
     )
     parser.add_argument(

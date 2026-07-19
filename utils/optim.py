@@ -84,6 +84,7 @@ def get_minimizer(model, optimizer, args):
             include_wclip=args.include_wclip,
             include_aclip=args.include_aclip,
             include_bn=args.include_bn,
+            include_bias=args.include_bias,
         )
     elif "QASAM" in args.opt_type:
         minimizer = qasam.QASAM(

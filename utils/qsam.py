@@ -14,6 +14,7 @@ class QSAM:
         include_wclip=False,
         include_aclip=False,
         include_bn=True,
+        include_bias=True,
     ):
         self.optimizer = optimizer
         self.model = model
@@ -21,6 +22,7 @@ class QSAM:
         self.include_wclip = include_wclip
         self.include_aclip = include_aclip
         self.include_bn = include_bn
+        self.include_bias = include_bias
         self.state = defaultdict(dict)
 
     @torch.no_grad()
@@ -41,7 +43,7 @@ class QSAM:
                         torch.norm(m.activation_clip_value.grad, p=2).to(shared_device)
                     )
 
-                if hasattr(m, "bias") and m.bias is not None:
+                if self.include_bias and hasattr(m, "bias") and m.bias is not None:
                     wgrads.append(torch.norm(m.bias.grad, p=2).to(shared_device))
             if self.include_bn:
                 if isinstance(m, nn.BatchNorm2d):
@@ -75,7 +77,7 @@ class QSAM:
                     e_w = p.grad * scale.to(p)
                     p.add_(e_w)
 
-                if hasattr(m, "bias") and m.bias is not None:
+                if self.include_bias and hasattr(m, "bias") and m.bias is not None:
                     p = m.bias
                     self.state[p]["old_p"] = p.data.clone()
                     e_w = p.grad * scale.to(p)
@@ -182,7 +184,7 @@ class QSAM:
                     p = m.activation_clip_value
                     p.data = self.state[p]["old_p"]
 
-                if hasattr(m, "bias") and m.bias is not None:
+                if self.include_bias and hasattr(m, "bias") and m.bias is not None:
                     p = m.bias
                     p.data = self.state[p]["old_p"]
             if self.include_bn:
@@ -227,7 +229,7 @@ class QSAM:
                     p = m.activation_clip_value
                     p.data = self.state[p]["old_p"]
 
-                if hasattr(m, "bias") and m.bias is not None:
+                if self.include_bias and hasattr(m, "bias") and m.bias is not None:
                     p = m.bias
                     p.data = self.state[p]["old_p"]
             if self.include_bn:
