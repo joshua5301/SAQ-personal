@@ -38,6 +38,10 @@ def get_qparser():
     parser.add_argument("--deterministic", type=bool, default=False,
                     help="TiltedSR/KLTilt: take the MAP of the tilted "
                          "distribution (b = [p > 0.5]) instead of sampling")
+    parser.add_argument("--crn", type=bool, default=True,
+                    help="KLTilt: reuse the first-pass SR uniform noise "
+                         "for the second-pass sample (common random numbers). "
+                         "Only meaningful when deterministic=False.")
     parser.add_argument("--flip_scope", type=str, default="global",
                     choices=["local", "global"],
                     help="LogitFlip budget scope: per-layer (local) or "

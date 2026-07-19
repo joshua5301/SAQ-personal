@@ -44,6 +44,7 @@ def get_minimizer(model, optimizer, args):
             model,
             tau=args.tau,
             deterministic=args.deterministic,
+            crn=args.crn,
             perturb_continuous=args.perturb_continuous,
             rho=args.rho,
         )

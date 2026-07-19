@@ -15,8 +15,15 @@ gain_i = g_i * step_i (= L(ceil) - L(floor)), the tilted distribution is
 with ONE global s chosen so that  sum_i KL(pi_i || r_i) = tau * d_valid.
 
 Knob: tau (nats per weight).
-    tau = 0     ->  exact SR-QAT (pi = r).
+    tau = 0     ->  exact SR-QAT when stochastic + crn=True (pi = r and
+                    the second pass reuses the first-pass SR sample, so
+                    epsilon = 0 coordinate-wise). Deterministic mode gives
+                    exact nearest-QAT at tau = 0 by the same construction.
     tau -> inf  ->  worst-case rounding (pi -> 1[gain > 0]).
+
+First-pass measure is coupled to `deterministic` (diagonal 2x2):
+    True  -> nearest first pass, MAP second pass
+    False -> SR first pass, SR-sample second pass (with CRN by default)
 
 Position dependence (weights deep in their bin are hard to flip) follows
 from the KL geometry; no separate cost heuristic.
@@ -48,7 +55,7 @@ class KLTilt:
     _LOG_S_MAX = math.log(1e12)
 
     def __init__(self, optimizer, model, tau=0.01,
-                 deterministic=False, mask_grid_exact=True,
+                 deterministic=False, crn=True, mask_grid_exact=True,
                  bisect_iters=20, warm_start_halfwidth=3.0,
                  perturb_continuous="none", rho=0.05):
         assert perturb_continuous in CONT_MODES, perturb_continuous
@@ -56,6 +63,7 @@ class KLTilt:
         self.model = model
         self.tau = tau
         self.deterministic = deterministic
+        self.crn = crn
         self.mask_grid_exact = mask_grid_exact
         self.bisect_iters = bisect_iters
         # bisection bracket half-width (in log s) around the previous s
@@ -65,6 +73,12 @@ class KLTilt:
         self._backups = {}       # {param: saved data}; restore iterates this
         self._log_s_prev = None  # warm start (python float, synced lazily)
         self._stats = {}         # tensors only; see stats()
+
+        # couple first-pass measure to the flag: diagonal cells of the 2x2
+        mode = "nearest" if deterministic else "sr"
+        for m_ in model.modules():
+            if isinstance(m_, (QConv2d, QLinear)):
+                m_.rounding_mode = mode
 
     # ------------------------------------------------------------------ #
     # helpers
@@ -202,22 +216,24 @@ class KLTilt:
             if self.deterministic:
                 b_ceil = pi > 0.5
             else:
-                b_ceil = torch.rand_like(pi) < pi
+                u = m.sr_u if (self.crn and getattr(m, "sr_u", None)
+                               is not None) else torch.rand_like(pi)
+                b_ceil = u < pi
 
-            nearest_is_ceil = ~nearest_is_floor
-            # epsilon relative to nearest: values in {-step, 0, +step}
+            # epsilon relative to what the FIRST pass actually applied
+            applied_is_ceil = m.applied_is_ceil
             m.epsilon = (b_ceil.to(step_out.dtype)
-                         - nearest_is_ceil.to(step_out.dtype)) * step_out
+                         - applied_is_ceil.to(step_out.dtype)) * step_out
 
             kl_spent += _bern_kl(pi[valid],
                                  torch.sigmoid(logit_r[valid])).sum()
-            flips += (b_ceil != nearest_is_ceil)[valid].sum().to(kl_spent.dtype)
+            flips += (b_ceil != applied_is_ceil)[valid].sum().to(kl_spent.dtype)
 
         # stats stay on device; materialize via stats() when logging
         self._stats = {
             "s": s,
             "kl_per_weight": kl_spent / max(n_valid_total, 1),
-            "flip_from_nearest_frac": flips / max(n_valid_total, 1),
+            "flip_from_applied_frac": flips / max(n_valid_total, 1),
             "n_valid": n_valid_total,
         }
 

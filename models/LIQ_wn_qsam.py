@@ -58,23 +58,38 @@ class QConv2d(LIQQConv2d):
             return x
         x = normalization_on_weights(x, clip_value)
         x = (x + 1.0) / 2.0
-        # --- FlipSAM: cache rounding geometry (detached; no autograd refs) ---
         n = float(2 ** int(k) - 1)
+
         scaled = x.detach() * n
         floor_lvl = torch.floor(scaled)
         r = scaled - floor_lvl
+        nearest_is_floor = r < 0.5
+
+        # --- first-pass rounding measure -----------------------------------
+        # rounding_mode: "nearest" (default) | "sr"; SR only while training
+        # so that eval/val always sees the deterministic nearest network.
+        use_sr = getattr(self, "rounding_mode", "nearest") == "sr" and self.training
+        if use_sr:
+            u = torch.rand_like(r)
+            applied_is_ceil = u < r                 # SR sample
+            q01 = (floor_lvl + applied_is_ceil.to(x.dtype)) / n
+            x_q = x + (q01 - x).detach()            # STE: identity backward
+        else:
+            u = None
+            applied_is_ceil = ~nearest_is_floor
+            x_q = quantization(x, k)                # 기존 RoundFunction (STE)
+
         self.rounding_cache = (
-            r,                                   # residual in [0, 1)
-            r < 0.5,                             # nearest_is_floor
-            floor_lvl,
-            n,
-            2.0 * clip_value.detach() / n,       # step_out (output domain)
+            r, nearest_is_floor, floor_lvl, n,
+            2.0 * clip_value.detach() / n,          # step_out
         )
-        # ---------------------------------------------------------------------
-        x = quantization(x, k)
-        x = x * 2.0 - 1.0
-        x = x * clip_value
-        self.x = x
+        self.applied_is_ceil = applied_is_ceil.detach()
+        self.sr_u = u                               # CRN용; nearest면 None
+        # -------------------------------------------------------------------
+
+        x_q = x_q * 2.0 - 1.0
+        x_q = x_q * clip_value
+        self.x = x_q
         if self.x.requires_grad:
             self.x.retain_grad()
         return self.x
@@ -172,23 +187,38 @@ class QLinear(LIQQLinear):
             return x
         x = normalization_on_weights(x, clip_value)
         x = (x + 1.0) / 2.0
-        # --- FlipSAM: cache rounding geometry (detached; no autograd refs) ---
         n = float(2 ** int(k) - 1)
+
         scaled = x.detach() * n
         floor_lvl = torch.floor(scaled)
         r = scaled - floor_lvl
+        nearest_is_floor = r < 0.5
+
+        # --- first-pass rounding measure -----------------------------------
+        # rounding_mode: "nearest" (default) | "sr"; SR only while training
+        # so that eval/val always sees the deterministic nearest network.
+        use_sr = getattr(self, "rounding_mode", "nearest") == "sr" and self.training
+        if use_sr:
+            u = torch.rand_like(r)
+            applied_is_ceil = u < r                 # SR sample
+            q01 = (floor_lvl + applied_is_ceil.to(x.dtype)) / n
+            x_q = x + (q01 - x).detach()            # STE: identity backward
+        else:
+            u = None
+            applied_is_ceil = ~nearest_is_floor
+            x_q = quantization(x, k)                # 기존 RoundFunction (STE)
+
         self.rounding_cache = (
-            r,                                   # residual in [0, 1)
-            r < 0.5,                             # nearest_is_floor
-            floor_lvl,
-            n,
-            2.0 * clip_value.detach() / n,       # step_out (output domain)
+            r, nearest_is_floor, floor_lvl, n,
+            2.0 * clip_value.detach() / n,          # step_out
         )
-        # ---------------------------------------------------------------------
-        x = quantization(x, k)
-        x = x * 2.0 - 1.0
-        x = x * clip_value
-        self.x = x
+        self.applied_is_ceil = applied_is_ceil.detach()
+        self.sr_u = u                               # CRN용; nearest면 None
+        # -------------------------------------------------------------------
+
+        x_q = x_q * 2.0 - 1.0
+        x_q = x_q * clip_value
+        self.x = x_q
         if self.x.requires_grad:
             self.x.retain_grad()
         return self.x
