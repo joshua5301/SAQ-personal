@@ -88,6 +88,12 @@ def get_qparser():
         "--grad_clip", type=float, default=5.0, help="maximum norm of gradient",
     )
     parser.add_argument(
+        "--num_calib_batches",
+        type=int,
+        default=10,
+        help="number of batches used to calibrate clip values in PTQ eval",
+    )
+    parser.add_argument(
         "--hidden_size", type=int, default=64, help="hidden dimension of controller"
     )
     parser.add_argument(
