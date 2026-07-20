@@ -18,5 +18,5 @@ python eval_ptq.py \
   --quan_type LIQ \
   --pretrained ./output/cifar100/sam_fp/r20/REPLACE_WITH_BEST_MODEL.pth \
   --qw 4.0 --qa 4.0 \
-  --num_calib_batches 10 \
+  --num_calib_batches 0 \
   --seed 1 --gpu 0

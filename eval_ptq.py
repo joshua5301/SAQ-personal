@@ -71,6 +71,9 @@ def calibrate(model, calib_loader, device, num_batches, logger):
     - weight clip: 0.8 * max|w| via each module's own init_weight_clip_val().
     - activation clip: 0.8 * running max|input| observed over `num_batches`.
 
+    Pass num_batches <= 0 to calibrate over the ENTIRE loader (one full pass,
+    QAT-style) for the most generous / stable activation-clip estimate.
+
     We set init_state=True on every quantized module so the built-in forward
     auto-init (LIQ) does not overwrite these values from a single stray batch.
     """
@@ -98,12 +101,18 @@ def calibrate(model, calib_loader, device, num_batches, logger):
 
     handles = [m.register_forward_pre_hook(make_hook(m)) for m in quant_modules]
 
+    # num_batches <= 0 -> use the entire loader (full-dataset calibration).
+    use_all = num_batches is None or num_batches <= 0
+    total = len(calib_loader) if use_all else min(num_batches, len(calib_loader))
+
     seen = 0
     for image, _ in calib_loader:
         model(image.to(device))
         seen += 1
-        if seen >= num_batches:
+        if not use_all and seen >= num_batches:
             break
+        if seen % 50 == 0 or seen == total:
+            logger.info("  calibration {}/{} batches".format(seen, total))
 
     for h in handles:
         h.remove()
@@ -112,8 +121,8 @@ def calibrate(model, calib_loader, device, num_batches, logger):
         m.activation_clip_value.data.fill_(0.8 * act_max[m])
 
     logger.info(
-        "Calibrated {} quantized modules over {} batch(es)".format(
-            len(quant_modules), seen
+        "Calibrated {} quantized modules over {} batch(es){}".format(
+            len(quant_modules), seen, " (full dataset)" if use_all else ""
         )
     )
 

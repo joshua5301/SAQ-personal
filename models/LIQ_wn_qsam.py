@@ -5,6 +5,26 @@ from torch.nn import functional as F
 import torch
 
 
+def snap_to_nearest_grid(perturbed, k, clip_value):
+    """Round a real-space weight tensor to the nearest quantization grid point.
+
+    The grid is the one used by quantize_weight: levels
+    ``(2*j/n - 1) * clip`` for ``j = 0..n`` with ``n = 2**k - 1`` and spacing
+    ``2*clip/n``, spanning ``[-clip, +clip]``.
+
+    A straight-through estimator is used: the forward value is the on-grid
+    rounded weight, but the backward pass is the identity w.r.t. ``perturbed``
+    so the gradient reaches the upstream continuous weight unchanged. Used by
+    RoundQSAM so the adversarial (second-forward) point lies on the grid.
+    """
+    cv = clip_value.detach()
+    n = float(2 ** int(k) - 1)
+    step = 2.0 * cv / n
+    level = torch.clamp(torch.round((perturbed.detach() + cv) / step), 0.0, n)
+    grid = level * step - cv
+    return perturbed + (grid - perturbed).detach()
+
+
 class QConv2d(LIQQConv2d):
     """
     custom convolutional layers for quantization with sam
@@ -105,7 +125,14 @@ class QConv2d(LIQQConv2d):
         self.x = x
         if self.x.requires_grad:
             self.x.retain_grad()
-        return self.x + epsilon
+        perturbed = self.x + epsilon
+        # RoundQSAM: snap the perturbed (adversarial) weight back onto the
+        # quantization grid so the second-forward gradient is evaluated at a
+        # valid quantized point. Plain QSAM leaves round_epsilon False and uses
+        # the off-grid perturbation directly.
+        if getattr(self, "round_epsilon", False):
+            perturbed = snap_to_nearest_grid(perturbed, k, clip_value)
+        return perturbed
 
     def forward(self, input):
         quantized_input = quantize_activation(
@@ -234,7 +261,14 @@ class QLinear(LIQQLinear):
         self.x = x
         if self.x.requires_grad:
             self.x.retain_grad()
-        return self.x + epsilon
+        perturbed = self.x + epsilon
+        # RoundQSAM: snap the perturbed (adversarial) weight back onto the
+        # quantization grid so the second-forward gradient is evaluated at a
+        # valid quantized point. Plain QSAM leaves round_epsilon False and uses
+        # the off-grid perturbation directly.
+        if getattr(self, "round_epsilon", False):
+            perturbed = snap_to_nearest_grid(perturbed, k, clip_value)
+        return perturbed
 
     def forward(self, input):
         if not self.init_state:
