@@ -11,10 +11,20 @@ import utils.kltilt as kltilt
 import utils.logitflip as logitflip
 import utils.gridusam as gridusam
 import utils.gridsam as gridsam
+import utils.klsam as klsam
 
 
 def get_minimizer(model, optimizer, args):
-    if "GridUSAM" in args.opt_type:
+    if "KLSAM" in args.opt_type:
+        minimizer = klsam.KLSAM(
+            optimizer,
+            model,
+            kappa=args.kappa,
+            deterministic=args.deterministic,
+            perturb_continuous=args.perturb_continuous,
+            rho=args.rho,
+        )
+    elif "GridUSAM" in args.opt_type:
         minimizer = gridusam.GridUSAM(
             optimizer,
             model,
