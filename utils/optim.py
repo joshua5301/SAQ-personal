@@ -3,6 +3,7 @@ import utils.asam as asam
 import utils.qasam as qasam
 # import utils.qasam as qasam
 import utils.qsam as qsam
+import utils.roundqsam as roundqsam
 import utils.sam as sam
 import utils.flipsam as flipsam
 import utils.tilted_sr as tilted_sr
@@ -85,6 +86,16 @@ def get_minimizer(model, optimizer, args):
             perturb_continuous=args.perturb_continuous,
             cont_radius=args.cont_radius,
             rho=args.rho,
+        )
+    elif "RoundQSAM" in args.opt_type:
+        minimizer = roundqsam.RoundQSAM(
+            optimizer,
+            model,
+            rho=args.rho,
+            include_wclip=args.include_wclip,
+            include_aclip=args.include_aclip,
+            include_bn=args.include_bn,
+            include_bias=args.include_bias,
         )
     elif "QSAM" in args.opt_type:
         minimizer = qsam.QSAM(

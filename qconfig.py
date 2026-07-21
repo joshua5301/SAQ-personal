@@ -1,6 +1,6 @@
 import os
 
-from core.config import create_dir, get_parser, params_check
+from core.config import create_dir, get_parser, params_check, str2bool
 
 
 def get_qparser():
@@ -8,7 +8,7 @@ def get_qparser():
     # general
     parser.add_argument(
         "--quantize_first_last",
-        type=bool,
+        type=str2bool,
         default=True,
         help="whether to quantize the first and last layer",
     )
@@ -35,10 +35,10 @@ def get_qparser():
                     choices=["output", "latent"],
                     help="GridUSAM flip-cost space: output (|delta|) or "
                          "latent (distance to rounding boundary)")
-    parser.add_argument("--deterministic", type=bool, default=False,
+    parser.add_argument("--deterministic", type=str2bool, default=False,
                     help="TiltedSR/KLTilt: take the MAP of the tilted "
                          "distribution (b = [p > 0.5]) instead of sampling")
-    parser.add_argument("--crn", type=bool, default=True,
+    parser.add_argument("--crn", type=str2bool, default=True,
                     help="KLTilt: reuse the first-pass SR uniform noise "
                          "for the second-pass sample (common random numbers). "
                          "Only meaningful when deterministic=False.")
@@ -62,30 +62,37 @@ def get_qparser():
     
     parser.add_argument(
         "--include_wclip",
-        type=bool,
+        type=str2bool,
         default=False,
         help="whether to include clip of weight in SAM",
     )
     parser.add_argument(
         "--include_aclip",
-        type=bool,
+        type=str2bool,
         default=True,
         help="whether to include clip of activation in SAM",
     )
     parser.add_argument(
         "--include_bn",
-        type=bool,
+        type=str2bool,
         default=True,
         help="whether to include bn parameters in SAM",
     )
     parser.add_argument(
         "--include_bias",
-        type=bool,
+        type=str2bool,
         default=True,
         help="whether to include conv/linear bias in QSAM",
     )
     parser.add_argument(
         "--grad_clip", type=float, default=5.0, help="maximum norm of gradient",
+    )
+    parser.add_argument(
+        "--num_calib_batches",
+        type=int,
+        default=0,
+        help="number of batches used to calibrate clip values in PTQ eval; "
+        "<= 0 uses the entire loader (full-dataset, QAT-style calibration)",
     )
     parser.add_argument(
         "--hidden_size", type=int, default=64, help="hidden dimension of controller"
@@ -124,7 +131,7 @@ def get_qparser():
     )
     parser.add_argument("--target_bops", type=float, default=648, help="target bops")
     parser.add_argument(
-        "--share_clip", type=bool, default=False, help="whether to share clip value"
+        "--share_clip", type=str2bool, default=False, help="whether to share clip value"
     )
     parser.add_argument(
         "--bit_warmup_epochs",
@@ -146,13 +153,13 @@ def get_qparser():
     )
     parser.add_argument(
         "--wa_same_bit",
-        type=bool,
+        type=str2bool,
         default=True,
         help="whether to set the same bit to weights and activations",
     )
     parser.add_argument(
         "--search_w_bit",
-        type=bool,
+        type=str2bool,
         default=False,
         help="whether to set the same bit to weights and activations",
     )

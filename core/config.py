@@ -6,6 +6,22 @@ from datetime import datetime
 from core.utils import is_main_process
 
 
+def str2bool(v):
+    """Parse a boolean from the command line.
+
+    argparse's ``type=bool`` is broken: it calls ``bool(str)`` so any non-empty
+    string (including "False") becomes True, making it impossible to pass False.
+    Use this instead so ``--flag False`` / ``--flag True`` both work.
+    """
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("yes", "true", "t", "1"):
+        return True
+    if v.lower() in ("no", "false", "f", "0"):
+        return False
+    raise argparse.ArgumentTypeError("boolean value expected, got {!r}".format(v))
+
+
 def get_parser():
     parser = argparse.ArgumentParser("classification")
 
@@ -47,7 +63,7 @@ def get_parser():
     )
     parser.add_argument(
         "--use_dali_cpu",
-        type=bool,
+        type=str2bool,
         default=False,
         help="whether to use cpu in data loading",
     )
