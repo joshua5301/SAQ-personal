@@ -35,6 +35,10 @@ def get_qparser():
                     choices=["output", "latent"],
                     help="GridUSAM flip-cost space: output (|delta|) or "
                          "latent (distance to rounding boundary)")
+    parser.add_argument("--m_floor_frac", type=float, default=0.0,
+                    help="GridSAM: lower bound m >= m_floor_frac * step on "
+                         "the boundary-distance cost (0 = disabled; ~0.01 to "
+                         "cap free flips of boundary-sitting weights)")
     parser.add_argument("--deterministic", type=str2bool, default=False,
                     help="TiltedSR/KLTilt: take the MAP of the tilted "
                          "distribution (b = [p > 0.5]) instead of sampling")
