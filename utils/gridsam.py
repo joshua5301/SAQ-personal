@@ -1,83 +1,83 @@
 """
-Latent-Boundary GridSAM: constrained SAM with a single fixed radius rho
-shared between rounding flips and continuous-parameter perturbation.
+GridSAM (count-budgeted): adversarial rounding flips, with the FLIP FRACTION
+as the knob. No continuous-parameter perturbation -- flips only.
 
-Inner problem (constraint form; exact SAM reduction when no flips):
+Inner problem (count budget):
 
-    max_{S, e}  sum_{i in S} gain_i  +  g_c^T e
-    s.t.        sum_{i in S} m_i^2  +  ||e||_2^2  <=  rho^2
+    max_S  sum_{i in S} gain_i     s.t.  |S| <= kappa * d_valid
 
-where, per quantized coordinate i,
-    gain_i = g_i * d_i          (1st-order flip gain, d_i = +-step_i)
-    m_i    = latent distance to the rounding boundary, in output units
-             = (1/2 - min(r_i, 1 - r_i)) * step_i
-and e is the perturbation of the continuous parameters (clip / bias / BN).
+    gain_i = g_i * d_i                  (1st-order flip gain, d_i = +-step_i)
+    m_i    = (1/2 - min(r_i, 1-r_i)) * step_i   (latent distance to boundary)
 
-Solution structure (concave in the spent budget):
-    - candidates (valid, gain > 0) are sorted globally by ratio gain / m^2
-    - for every prefix k:  Phi(k) = G_k + ||g_c|| * sqrt(rho^2 - C_k)
-    - S* = argmax-prefix;  remaining radius rho_c = sqrt(rho^2 - C*)
-      is spent on a standard (normalized) SAM step for continuous params:
-          e = rho_c * g_c / ||g_c||
+Solved exactly for this budget: rank candidates (gain > 0) by efficiency
+gain_i / m_i^2 and take the top kappa * d_valid.
 
-Properties:
-    - no quantized flips selected  ->  exactly standard SAM with radius rho
-    - rho -> 0                     ->  nearest-rounding baseline
-    - rho is a genuine fixed L2 radius, inherited verbatim from SAQ
+Why kappa instead of a distance budget rho^2: with an absolute rho^2 budget
+the realized flip COUNT is fixed but the flip FRACTION scales as 1/d, and the
+cost m^2 carries weight-space units (step = 2*clip/n), so the same rho means
+wildly different interventions across network size, layer size, bit-width,
+and even across training as clip is learned. kappa is dimensionless and
+invariant to all four: "flip this fraction of the weights".
 
-Design constants (not knobs):
-    - m^2 floor: m_i^2 >= (M_FLOOR_FRAC * step_i)^2, preventing
-      boundary-sitting (oscillating) coordinates from consuming the
-      budget for free with vanishing cost.
+The boundary distance m still sets the ORDER (position-aware: weights close
+to their rounding boundary are cheap and get flipped first) -- it just no
+longer sets the budget. Ordering uses m in weight-space units, so a layer
+with a coarser grid (larger step) is correctly deprioritized in global mode:
+its flips genuinely require more latent movement.
 
-Implementation note: flips are realized through the epsilon hook
-(m.epsilon = +-step on selected coords), i.e. the second pass evaluates
-Q(w) + eps via quantize_weight_add_epsilon. Under LIQ_wn this coincides
-with actually moving the latent weight across its boundary up to the
-tiny mean/std re-normalization side effect; the epsilon path is used
-because it is exact in the cached geometry's domain and reuses the
-battle-tested set_second_forward machinery.
+scope="global": one network-wide count, kappa * d_valid_total, allocated
+                across layers by efficiency (concentration allowed).
+scope="local" : kappa * d_valid_layer per layer (uniform fraction, no
+                cross-layer transfer).
+
+Properties: kappa -> 0  ->  nearest-rounding QAT baseline (no flips).
+Design constant: m^2 floor (m >= M_FLOOR_FRAC * step) so boundary-sitting
+(oscillating) coordinates do not dominate the ranking with vanishing cost.
+
+Spent distance sum_{i in S} m_i^2 is logged for post-hoc reporting (it is the
+budget the constraint-form formulation would have used).
 """
 
+from __future__ import annotations
+
+from typing import Dict, List, Optional
+
 import torch
+
 from models.LIQ_wn_qsam import QConv2d, QLinear
-from utils.cont_perturb import CONT_MODES, gather_cont_params
 
 
 class GridSAM:
 
-    M_FLOOR_FRAC = 0.01   # design constant: minimum flip cost as a step fraction
+    M_FLOOR_FRAC = 0.00   # design constant: minimum flip cost, step fraction
 
-    def __init__(self, optimizer, model, rho=0.05,
-                 perturb_continuous="qsam_default", mask_grid_exact=True):
-        assert perturb_continuous in CONT_MODES, perturb_continuous
+    def __init__(self, optimizer, model, kappa: float = 0.01,
+                 scope: str = "global", mask_grid_exact: bool = True,
+                 min_flips_per_layer: int = 0):
+        assert 0.0 <= kappa < 1.0, kappa
+        assert scope in ("global", "local"), scope
         self.optimizer = optimizer
         self.model = model
-        self.rho = rho
-        self.perturb_continuous = perturb_continuous
+        self.kappa = float(kappa)          # target flip fraction
+        self.scope = scope
         self.mask_grid_exact = mask_grid_exact
-        self._backups = {}   # {param: saved data}; restore iterates this
-        self._stats = {}     # tensors only; materialized via stats()
+        # local scope only: floor so tiny layers still get trained adversarially
+        self.min_flips_per_layer = int(min_flips_per_layer)
+        self.flip_stats: Dict[str, dict] = {}
 
-    # ------------------------------------------------------------------ #
-    # helpers
-    # ------------------------------------------------------------------ #
-
-    def _is_quantized(self, m):
+    def _is_quantized(self, m) -> bool:
         return isinstance(m, (QConv2d, QLinear)) and m.bits_weights != 32
 
+    # ------------------------------------------------------------------ #
+    # geometry
+    # ------------------------------------------------------------------ #
+
     @torch.no_grad()
-    def _layer_candidates(self, m):
-        """
-        Returns (gain, delta_flip, m_sq, cand) for one quantized layer,
-        or None if grad / cache is unavailable.
-          cand: mask of flip candidates (valid & gain > 0)
-          m_sq: floored squared latent boundary distance (output units)
-        """
-        g = m.x.grad
+    def _geometry(self, module) -> Optional[dict]:
+        g = module.x.grad
         if g is None:
             return None
-        cache = getattr(m, "rounding_cache", None)
+        cache = getattr(module, "rounding_cache", None)
         if cache is None:
             raise RuntimeError(
                 "[GridSAM] rounding_cache missing. "
@@ -86,8 +86,7 @@ class GridSAM:
         r, nearest_is_floor, floor_lvl, n, step_out = cache
 
         dir_sign = torch.where(
-            nearest_is_floor, torch.ones_like(r), -torch.ones_like(r)
-        )
+            nearest_is_floor, torch.ones_like(r), -torch.ones_like(r))
         delta_flip = dir_sign * step_out
 
         valid = ~(nearest_is_floor & (floor_lvl >= n))
@@ -95,139 +94,156 @@ class GridSAM:
             valid &= r > 0.0
 
         gain = g * delta_flip
-
-        m_dist = (0.5 - torch.minimum(r, 1.0 - r)) * step_out
-        m_floor = self.M_FLOOR_FRAC * step_out
-        m_sq = torch.maximum(m_dist, m_floor).square()
+        m_dist = torch.clamp((0.5 - torch.minimum(r, 1.0 - r)) * step_out,
+                             min=0.0)
+        m_dist = torch.maximum(m_dist, self.M_FLOOR_FRAC * step_out)
+        m_sq = m_dist.square()
 
         cand = valid & (gain > 0)
-        return gain, delta_flip, m_sq, cand
+        return {"module": module, "delta": delta_flip,
+                "gain": gain, "cost": m_sq, "cand": cand,
+                "n_valid": int(valid.sum().item())}
+
+    @torch.no_grad()
+    def _write_epsilon(self, e: dict, selected_flat: torch.Tensor) -> None:
+        mask = selected_flat.view_as(e["delta"])
+        e["module"].epsilon = mask.to(e["delta"].dtype) * e["delta"]
 
     # ------------------------------------------------------------------ #
     # SAM interface (engine.py calls these)
     # ------------------------------------------------------------------ #
 
     @torch.no_grad()
-    def ascent_step(self):
-        self._backups.clear()
-        rho_sq = self.rho * self.rho
+    def ascent_step(self) -> None:
+        self.flip_stats = {}
 
-        # ---- pass 1: gather candidates across all quantized layers ----
-        layers = []                # (m, delta_flip, cand, d)
-        pool_gain, pool_cost = [], []
-        pool_layer, pool_pos = [], []
-        for lid, (name, m) in enumerate(
-                (n_, m_) for n_, m_ in self.model.named_modules()
-                if self._is_quantized(m_)):
-            res = self._layer_candidates(m)
-            if res is None:
+        entries: List[dict] = []
+        names: List[str] = []
+        for name, m in self.model.named_modules():
+            if not self._is_quantized(m):
                 continue
-            gain, delta_flip, m_sq, cand = res
-            layers.append((m, delta_flip, cand))
-            idx = cand.flatten().nonzero(as_tuple=True)[0]
-            if idx.numel() > 0:
-                pool_gain.append(gain.flatten()[idx])
-                pool_cost.append(m_sq.flatten()[idx])
-                pool_layer.append(torch.full_like(idx, len(layers) - 1))
-                pool_pos.append(idx)
+            e = self._geometry(m)
+            if e is None:
+                continue
+            entries.append(e)
+            names.append(name)
 
-        # ---- continuous gradient norm (for the sqrt term) ----
-        cont_params = [p for p in
-                       gather_cont_params(self.model, self.perturb_continuous)
-                       if p.grad is not None]
-        if cont_params:
-            gc_norm = torch.norm(torch.stack(
-                [p.grad.norm(p=2) for p in cont_params]), p=2)
+        if not entries:
+            self.optimizer.zero_grad()
+            return
+
+        if self.scope == "local":
+            self._select_local(names, entries)
         else:
-            gc_norm = None
+            self._select_global(names, entries)
 
-        # ---- solver: global argmax-prefix by ratio = gain / m^2 ----
-        n_flip = 0
-        spent = None
-        if pool_gain:
-            G = torch.cat(pool_gain)
-            C = torch.cat(pool_cost)
-            L = torch.cat(pool_layer)
-            P = torch.cat(pool_pos)
+        self.optimizer.zero_grad()
 
-            order = torch.argsort(G / C, descending=True)
-            cum_g = G[order].cumsum(0)
-            cum_c = C[order].cumsum(0)
-            feasible = cum_c <= rho_sq
-
-            # Phi(k) for prefixes k = 0..K (k = 0: pure SAM)
-            zero = torch.zeros((), device=G.device, dtype=G.dtype)
-            resid = (rho_sq - cum_c).clamp_min(0.0).sqrt()
-            if gc_norm is not None:
-                phi = cum_g + gc_norm * resid
-                phi0 = gc_norm * self.rho + zero
-            else:
-                phi = cum_g
-                phi0 = zero
-            phi = torch.where(feasible, phi,
-                              torch.full_like(phi, torch.finfo(phi.dtype).min))
-            best = int(torch.argmax(torch.cat([phi0.reshape(1), phi])))
-
-            if best > 0:
-                chosen = order[:best]
-                n_flip = best
-                spent = cum_c[best - 1]
-                # scatter chosen candidates back to per-layer epsilon
-                ch_layer = L[chosen]
-                ch_pos = P[chosen]
-                for lid, (m, delta_flip, cand) in enumerate(layers):
-                    sel = ch_pos[ch_layer == lid]
-                    mask = torch.zeros(delta_flip.numel(), dtype=torch.bool,
-                                       device=delta_flip.device)
-                    if sel.numel() > 0:
-                        mask[sel] = True
-                    m.epsilon = (mask.view_as(delta_flip)
-                                 .to(delta_flip.dtype) * delta_flip)
-            else:
-                for m, delta_flip, _ in layers:
-                    m.epsilon = torch.zeros_like(delta_flip)
-        else:
-            for m, delta_flip, _ in layers:
-                m.epsilon = torch.zeros_like(delta_flip)
-
-        dev = (cont_params[0].device if cont_params
-               else (layers[0][1].device if layers else "cpu"))
-        if spent is None:
-            spent = torch.zeros((), device=dev)
-
-        # ---- continuous params: standard SAM with the REMAINING radius ----
-        rho_c = (rho_sq - spent).clamp_min(0.0).sqrt()
-        if cont_params and gc_norm is not None and gc_norm > 1e-12:
-            scale = rho_c / gc_norm
-            for p in cont_params:
-                self._backups[p] = p.data.clone()
-                p.add_(p.grad * scale)
-
-        self._stats = {
-            "n_flip": torch.as_tensor(n_flip),
-            "budget_spent_frac": spent / max(rho_sq, 1e-24),
-            "rho_c": rho_c,
+    # ---- kappa * d_valid_layer flips per layer ---- #
+    @torch.no_grad()
+    def _select_local(self, names, entries) -> None:
+        total_flips, total_valid, total_spent = 0, 0, 0.0
+        for name, e in zip(names, entries):
+            idx = e["cand"].flatten().nonzero(as_tuple=True)[0]
+            selected = torch.zeros(e["delta"].numel(), dtype=torch.bool,
+                                   device=e["delta"].device)
+            k_target = int(self.kappa * e["n_valid"])
+            if self.min_flips_per_layer > 0 and e["n_valid"] > 0:
+                k_target = max(k_target, self.min_flips_per_layer)
+            spent = 0.0
+            if idx.numel() > 0 and k_target > 0:
+                g = e["gain"].flatten()[idx]
+                c = e["cost"].flatten()[idx]
+                k = min(k_target, idx.numel())
+                top = torch.topk(g / c, k).indices
+                selected[idx[top]] = True
+                spent = float(c[top].sum().item())
+            self._write_epsilon(e, selected)
+            nf = int(selected.sum().item())
+            total_flips += nf
+            total_valid += e["n_valid"]
+            total_spent += spent
+            self.flip_stats[name] = {
+                "flips": nf, "n_valid": e["n_valid"],
+                "flip_frac_valid": nf / max(e["n_valid"], 1),
+                "k_target": k_target, "spent_m_sq": spent,
+            }
+        self.flip_stats["__global__"] = {
+            "flips": total_flips, "n_valid": total_valid,
+            "flip_frac_valid": total_flips / max(total_valid, 1),
+            "kappa_target": self.kappa, "spent_m_sq": total_spent,
         }
 
+    # ---- kappa * d_valid_total flips network-wide ---- #
     @torch.no_grad()
-    def stats(self):
-        """Materialize diagnostics (one sync). Call every N steps."""
-        return {k: (float(v) if torch.is_tensor(v) else v)
-                for k, v in self._stats.items()}
+    def _select_global(self, names, entries) -> None:
+        pool_g, pool_c, pool_layer, pool_pos = [], [], [], []
+        for lid, e in enumerate(entries):
+            idx = e["cand"].flatten().nonzero(as_tuple=True)[0]
+            if idx.numel() > 0:
+                pool_g.append(e["gain"].flatten()[idx])
+                pool_c.append(e["cost"].flatten()[idx])
+                pool_layer.append(torch.full_like(idx, lid))
+                pool_pos.append(idx)
+
+        n_valid_total = sum(e["n_valid"] for e in entries)
+        k_target = int(self.kappa * n_valid_total)
+
+        chosen_layer = chosen_pos = None
+        spent = 0.0
+        if pool_g and k_target > 0:
+            G = torch.cat(pool_g)
+            C = torch.cat(pool_c)
+            Lyr = torch.cat(pool_layer)
+            Pos = torch.cat(pool_pos)
+            k = min(k_target, G.numel())
+            top = torch.topk(G / C, k).indices
+            chosen_layer = Lyr[top]
+            chosen_pos = Pos[top]
+            spent = float(C[top].sum().item())
+
+        total_flips = 0
+        for lid, (name, e) in enumerate(zip(names, entries)):
+            selected = torch.zeros(e["delta"].numel(), dtype=torch.bool,
+                                   device=e["delta"].device)
+            if chosen_pos is not None:
+                here = chosen_pos[chosen_layer == lid]
+                if here.numel() > 0:
+                    selected[here] = True
+            self._write_epsilon(e, selected)
+            nf = int(selected.sum().item())
+            total_flips += nf
+            self.flip_stats[name] = {
+                "flips": nf, "n_valid": e["n_valid"],
+                "flip_frac_valid": nf / max(e["n_valid"], 1),
+            }
+        self.flip_stats["__global__"] = {
+            "flips": total_flips, "n_valid": n_valid_total,
+            "flip_frac_valid": total_flips / max(n_valid_total, 1),
+            "kappa_target": self.kappa, "k_target": k_target,
+            "spent_m_sq": spent,
+        }
+
+    # ------------------------------------------------------------------ #
 
     @torch.no_grad()
-    def _restore(self):
-        for p, data in self._backups.items():
-            p.data = data
-        self._backups.clear()
+    def _clear_rounding_eps(self) -> None:
+        for m in self.model.modules():
+            if not self._is_quantized(m):
+                continue
+            eps = getattr(m, "epsilon", None)
+            if torch.is_tensor(eps):
+                m.epsilon = torch.zeros_like(eps)
+            elif hasattr(m, "epsilon"):
+                m.epsilon = None
 
     @torch.no_grad()
-    def descent_step(self):
-        self._restore()
+    def descent_step(self) -> None:
+        self._clear_rounding_eps()
         self.optimizer.step()
         self.optimizer.zero_grad()
 
     @torch.no_grad()
-    def restore_step(self):
-        self._restore()
+    def restore_step(self) -> None:
+        self._clear_rounding_eps()
         self.optimizer.zero_grad()

@@ -12,6 +12,7 @@ import utils.kltilt as kltilt
 import utils.logitflip as logitflip
 import utils.gridusam as gridusam
 import utils.gridsam as gridsam
+import utils.gridsam_old as gridsam_old
 import utils.klsam as klsam
 import utils.AdvQuant as advquant
 
@@ -42,12 +43,19 @@ def get_minimizer(model, optimizer, args):
             space=args.space,
             perturb_continuous=args.perturb_continuous,
         )
-    elif "GridSAM" in args.opt_type:
-        minimizer = gridsam.GridSAM(
+    elif "GridSAMOld" in args.opt_type:
+        minimizer = gridsam_old.GridSAM(
             optimizer,
             model,
             rho=args.rho,
             perturb_continuous=args.perturb_continuous,
+        )
+    elif "GridSAM" in args.opt_type:
+        minimizer = gridsam.GridSAM(
+            optimizer,
+            model,
+            kappa=args.kappa,
+            scope=args.kappa_mode,
         )
     elif "LogitFlip" in args.opt_type:
         minimizer = logitflip.LogitFlip(
