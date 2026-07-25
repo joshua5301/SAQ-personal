@@ -119,17 +119,28 @@ class QConv2d(LIQQConv2d):
             return x
         x = normalization_on_weights(x, clip_value)
         x = (x + 1.0) / 2.0
-        x = quantization(x, k)
-        x = x * 2.0 - 1.0
-        x = x * clip_value
-        self.x = x
+        n = float(2 ** int(k) - 1)
+
+        # Rebuild the SAME base the first pass used. Under rounding_mode="sr"
+        # reuse the stored sr_u (common random numbers) so every unselected
+        # coordinate reproduces the first pass exactly; only epsilon moves the
+        # selected ones. Otherwise fall back to nearest (plain QSAM / eval).
+        if getattr(self, "rounding_mode", "nearest") == "sr" \
+                and self.training and getattr(self, "sr_u", None) is not None:
+            scaled = x.detach() * n
+            floor_lvl = torch.floor(scaled)
+            applied_is_ceil = self.sr_u < (scaled - floor_lvl)
+            q01 = (floor_lvl + applied_is_ceil.to(x.dtype)) / n
+            x_q = x + (q01 - x).detach()            # STE: identity backward
+        else:
+            x_q = quantization(x, k)
+
+        x_q = x_q * 2.0 - 1.0
+        x_q = x_q * clip_value
+        self.x = x_q
         if self.x.requires_grad:
             self.x.retain_grad()
         perturbed = self.x + epsilon
-        # RoundQSAM: snap the perturbed (adversarial) weight back onto the
-        # quantization grid so the second-forward gradient is evaluated at a
-        # valid quantized point. Plain QSAM leaves round_epsilon False and uses
-        # the off-grid perturbation directly.
         if getattr(self, "round_epsilon", False):
             perturbed = snap_to_nearest_grid(perturbed, k, clip_value)
         return perturbed
@@ -255,17 +266,28 @@ class QLinear(LIQQLinear):
             return x
         x = normalization_on_weights(x, clip_value)
         x = (x + 1.0) / 2.0
-        x = quantization(x, k)
-        x = x * 2.0 - 1.0
-        x = x * clip_value
-        self.x = x
+        n = float(2 ** int(k) - 1)
+
+        # Rebuild the SAME base the first pass used. Under rounding_mode="sr"
+        # reuse the stored sr_u (common random numbers) so every unselected
+        # coordinate reproduces the first pass exactly; only epsilon moves the
+        # selected ones. Otherwise fall back to nearest (plain QSAM / eval).
+        if getattr(self, "rounding_mode", "nearest") == "sr" \
+                and self.training and getattr(self, "sr_u", None) is not None:
+            scaled = x.detach() * n
+            floor_lvl = torch.floor(scaled)
+            applied_is_ceil = self.sr_u < (scaled - floor_lvl)
+            q01 = (floor_lvl + applied_is_ceil.to(x.dtype)) / n
+            x_q = x + (q01 - x).detach()            # STE: identity backward
+        else:
+            x_q = quantization(x, k)
+
+        x_q = x_q * 2.0 - 1.0
+        x_q = x_q * clip_value
+        self.x = x_q
         if self.x.requires_grad:
             self.x.retain_grad()
         perturbed = self.x + epsilon
-        # RoundQSAM: snap the perturbed (adversarial) weight back onto the
-        # quantization grid so the second-forward gradient is evaluated at a
-        # valid quantized point. Plain QSAM leaves round_epsilon False and uses
-        # the off-grid perturbation directly.
         if getattr(self, "round_epsilon", False):
             perturbed = snap_to_nearest_grid(perturbed, k, clip_value)
         return perturbed

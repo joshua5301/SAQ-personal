@@ -1,39 +1,65 @@
 """
-AdvQuant: SR-anchored adversarial rounding for quantized weights.
+AdvQuant (SR-anchored, SR first pass): adversarial rounding by PINNING.
 
-The adversary pins a subset S of coordinates to their non-nearest rounding
-level while leaving the rest stochastic (SR). Relative to the SR posterior
-P_SR (independent Bernoullis, P(ceil_i) = r_i), both the value and the cost
-of a flip are measured against that SAME anchor:
+Objective (what the accounting is derived from): the adversary picks a set S
+and pins each i in S to its MINOR level (the non-nearest side of the SR
+distribution), leaving all other coordinates stochastic:
 
-    u_i    = |logit(r_i)|                          (how deep in the bin)
-    value_i = gain_i * sigmoid(u_i)                (marginal loss gain over SR)
-            = (g_i * delta_flip_i) * (1 - p_i),  p_i = min(r_i, 1-r_i)
-    cost_i  = softplus(u_i) = KL(delta_flip_i || Bern(r_i))   (>= log 2)
+    Q_A = prod_{i in S} delta_minor_i  x  prod_{i not in S} Bern(r_i)
 
-Rationale for the SR anchor (both terms use it, so accounting is consistent):
-  - value: SR already flips coord i with prob p_i, so deterministically
-    pinning it adds only the (1 - p_i) fraction of the flip gain.
-  - cost : softplus(u) is the exact KL of pinning one coordinate; its log-2
-    floor means boundary weights (r ~ 1/2) are NOT free -- no cost hacks.
-  - sigmoid and softplus are the mean and potential of the same
-    exponential family, so value/cost is well-behaved everywhere:
-        deep in bin (u large):  value -> gain,      cost -> u  (=> ~ old LogitFlip)
-        at boundary (u -> 0)  :  value -> gain/2,   cost -> log 2
+Against the SR anchor P_SR this gives, per coordinate (u_i = |logit r_i|):
 
-Inner problem (global, one network-wide budget):
+    value_i = E_{Q_A}[L] - E_{P_SR}[L] = gain_i * sigmoid(u_i)
+    cost_i  = KL(delta_minor_i || Bern(r_i)) = softplus(u_i)   (>= log 2)
 
-    max_x  sum_i value_i x_i   s.t.  sum_i cost_i x_i <= tau * d_valid,  x in {0,1}
+Pinning is an act on the DISTRIBUTION: the flip target is the minor level,
+fixed by the geometry (nearest_is_floor), NOT by the sample the first pass
+happened to draw. The SR sample plays exactly two roles:
 
-solved by the feasible gain/cost greedy (fractional-knapsack relaxation; not
-an exact 0-1 solver, but each item's cost << budget so the gap is negligible).
+  1. measurement point: the first pass samples P_SR, so m.x.grad is a
+     1-sample unbiased estimate of the SR-expected gradient (gain estimator);
+  2. base of the second pass: with common random numbers (the same sr_u),
+     the second pass reproduces the first pass's rounding on unselected
+     coordinates, so the loss difference is attributable to the pins alone.
 
-Knob: tau (nats/valid weight). tau = 0 -> nearest-rounding QAT (no flips).
+Realization: for a selected coordinate the second pass must sit at the minor
+level, so
+
+    epsilon_i = (minor_level_i - applied_level_i) * step_i
+              = (nearest_is_floor_i - applied_is_ceil_i) * step_i
+              in {-step, 0, +step}
+
+epsilon = 0 when the SR draw already landed on the minor side -- the pin is
+already satisfied, a genuine no-op. In expectation the fraction of selected
+coordinates that actually move is sigma(u): the same factor that discounts
+the value. Derivation and realization are two faces of one object.
+
+tau = 0 with CRN reproduces SR-QAT exactly (epsilon == 0 everywhere and the
+second pass equals the first).
+
+REQUIRES the quantizer patched so that
+  - quantize_weight supports rounding_mode="sr" while training and stores
+    self.applied_is_ceil and self.sr_u (already done), and
+  - quantize_weight_add_epsilon REUSES self.sr_u (CRN) to rebuild the same
+    SR base before adding epsilon (patch below, mirror of quantize_weight):
+
+        if getattr(self, "rounding_mode", "nearest") == "sr" \
+                and self.training and self.sr_u is not None:
+            scaled = x.detach() * n
+            floor_lvl = torch.floor(scaled)
+            applied_is_ceil = self.sr_u < (scaled - floor_lvl)
+            q01 = (floor_lvl + applied_is_ceil.to(x.dtype)) / n
+            x_q = x + (q01 - x).detach()
+        else:
+            x_q = quantization(x, k)
+
+Knob: tau (nats per valid weight); realized flip statistics are logged so a
+count-parameterized (kappa) variant can be swapped in if tau drifts.
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import torch
 import torch.nn.functional as F
@@ -59,13 +85,21 @@ class AdvQuant:
         self.logit_eps = logit_eps
         self.flip_stats: Dict[str, dict] = {}
         self._backups = {}
+        # first pass samples the SR distribution (eval stays nearest via the
+        # quantizer's self.training guard)
+        for m in self.model.modules():
+            if self._is_quantized(m):
+                m.rounding_mode = "sr"
 
     def _is_quantized(self, m) -> bool:
         return isinstance(m, (QConv2d, QLinear)) and m.bits_weights != 32
 
+    # ------------------------------------------------------------------ #
+    # geometry
+    # ------------------------------------------------------------------ #
+
     @torch.no_grad()
     def _geometry(self, module) -> Optional[dict]:
-        """value = gain*sigmoid(u), cost = softplus(u), candidate mask."""
         g = module.x.grad
         if g is None:
             return None
@@ -75,37 +109,53 @@ class AdvQuant:
                 "[AdvQuant] rounding_cache missing. "
                 "Did you patch quantize_weight() in LIQ_wn_qsam.py?"
             )
+        applied_is_ceil = getattr(module, "applied_is_ceil", None)
+        if applied_is_ceil is None:
+            raise RuntimeError(
+                "[AdvQuant] applied_is_ceil missing. "
+                "Is rounding_mode='sr' active on the first pass?"
+            )
         r, nearest_is_floor, floor_lvl, n, step_out = cache
 
-        direction = torch.where(
-            nearest_is_floor, torch.ones_like(r), -torch.ones_like(r))
-        delta_flip = direction * step_out
+        # ---- flip target is the MINOR level (distribution-defined) ----
+        # minor = ceil  if nearest is floor  -> displacement +step
+        # minor = floor if nearest is ceil   -> displacement -step
+        to_minor = torch.where(nearest_is_floor,
+                               torch.ones_like(r), -torch.ones_like(r))
+        d_minor = to_minor * step_out          # major -> minor displacement
 
+        # the minor level must exist on the grid
         valid = ~(nearest_is_floor & (floor_lvl >= n))
         if self.mask_grid_exact:
             valid &= r > 0.0
 
+        # ---- SR-anchored accounting ----
         r_safe = r.clamp(self.logit_eps, 1.0 - self.logit_eps)
         u = torch.logit(r_safe).abs()
-        value = (g * delta_flip) * torch.sigmoid(u)   # SR-marginal gain
-        cost = F.softplus(u)                          # exact flip KL, >= log 2
+        gain = g * d_minor                     # SR-sample-point gradient est.
+        value = gain * torch.sigmoid(u)        # marginal over the SR anchor
+        cost = F.softplus(u)                   # exact pin KL, >= log 2
+
+        # ---- realization: epsilon relative to the APPLIED SR sample ----
+        # {-step, 0, +step}; 0 when the draw already sits on the minor side
+        eps_if_selected = (nearest_is_floor.to(step_out.dtype)
+                           - applied_is_ceil.to(step_out.dtype)) * step_out
 
         cand = valid & (value > 0)
-        return {"module": module, "delta": delta_flip,
+        return {"module": module, "eps_full": eps_if_selected,
                 "value": value, "cost": cost, "cand": cand,
                 "n_valid": int(valid.sum().item())}
 
-    @torch.no_grad()
-    def _write_epsilon(self, entry: dict, selected_flat: torch.Tensor) -> None:
-        mask = selected_flat.view_as(entry["delta"])
-        entry["module"].epsilon = mask.to(entry["delta"].dtype) * entry["delta"]
+    # ------------------------------------------------------------------ #
+    # SAM interface (engine.py calls these)
+    # ------------------------------------------------------------------ #
 
     @torch.no_grad()
     def ascent_step(self) -> None:
         self._backups.clear()
         self.flip_stats = {}
 
-        # ---- pass 1: gather geometry, build the global candidate pool ----
+        # ---- gather the global candidate pool ----
         entries, names = [], []
         pool_val, pool_cost, pool_layer, pool_pos = [], [], [], []
         for name, m in self.model.named_modules():
@@ -127,7 +177,7 @@ class AdvQuant:
         n_valid_total = sum(e["n_valid"] for e in entries)
         budget = self.tau * n_valid_total
 
-        # ---- global gain/cost greedy over the pooled candidates ----
+        # ---- global value/cost greedy ----
         chosen_layer = chosen_pos = None
         spent = 0.0
         if pool_val and budget > 0.0:
@@ -142,27 +192,39 @@ class AdvQuant:
             chosen_pos = Pos[sel]
             spent = float(C[sel].sum().item())
 
-        # ---- scatter selection back to per-layer epsilon ----
-        total_flips = 0
+        # ---- write per-layer epsilon (pin selected coords to minor) ----
+        total_sel = 0
+        total_moved = 0
         for lid, (name, e) in enumerate(zip(names, entries)):
-            selected = torch.zeros(e["delta"].numel(), dtype=torch.bool,
-                                   device=e["delta"].device)
+            selected = torch.zeros(e["eps_full"].numel(), dtype=torch.bool,
+                                   device=e["eps_full"].device)
             if chosen_pos is not None:
                 here = chosen_pos[chosen_layer == lid]
                 if here.numel() > 0:
                     selected[here] = True
-            self._write_epsilon(e, selected)
-            nf = int(selected.sum().item())
-            total_flips += nf
+            sel_mask = selected.view_as(e["eps_full"])
+            e["module"].epsilon = (sel_mask.to(e["eps_full"].dtype)
+                                   * e["eps_full"])
+            nf = int(sel_mask.sum().item())
+            moved = int((e["module"].epsilon != 0).sum().item())
+            total_sel += nf
+            total_moved += moved
             self.flip_stats[name] = {
-                "flips": nf, "n_valid": e["n_valid"],
-                "flip_frac_valid": nf / max(e["n_valid"], 1),
+                "selected": nf,
+                "moved": moved,                 # draw was on major -> pin moves it
+                "already_minor": nf - moved,    # draw was on minor -> pin is no-op
+                "n_valid": e["n_valid"],
             }
 
         self.flip_stats["__global__"] = {
-            "flips": total_flips, "n_valid": n_valid_total,
-            "flip_frac_valid": total_flips / max(n_valid_total, 1),
-            "budget_nats": budget, "spent_nats": spent,
+            "selected": total_sel,
+            "moved": total_moved,
+            "already_minor": total_sel - total_moved,
+            "moved_frac_of_selected": total_moved / max(total_sel, 1),
+            "selected_frac_valid": total_sel / max(n_valid_total, 1),
+            "n_valid": n_valid_total,
+            "budget_nats": budget,
+            "spent_nats": spent,
             "budget_utilization": spent / max(budget, 1e-12),
         }
 
