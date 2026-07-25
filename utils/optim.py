@@ -13,10 +13,19 @@ import utils.logitflip as logitflip
 import utils.gridusam as gridusam
 import utils.gridsam as gridsam
 import utils.klsam as klsam
+import utils.AdvQuant as advquant
 
 
 def get_minimizer(model, optimizer, args):
-    if "KLSAM" in args.opt_type:
+    if "AdvQuant" in args.opt_type:
+        minimizer = advquant.AdvQuant(
+            optimizer,
+            model,
+            tau=args.tau,
+            perturb_continuous=args.perturb_continuous,
+            rho=args.rho,
+        )
+    elif "KLSAM" in args.opt_type:
         minimizer = klsam.KLSAM(
             optimizer,
             model,
