@@ -40,7 +40,7 @@ class LogitFlip:
         rho: float = 0.05,
         mask_grid_exact: bool = True,
         logit_eps: float = 1e-6,
-        free_cost_eps: float = 1e-12,
+        free_cost_eps: float = 0,
     ):
         assert tau >= 0.0, tau
         assert scope in ("global", "local"), scope
@@ -176,7 +176,7 @@ class LogitFlip:
             candidate_idx = (valid & (gain > 0)).nonzero(as_tuple=True)[0]
 
             n_valid = int(valid.sum().item())
-            budget = self.tau * n_valid
+            budget = self.tau # * n_valid
             selected = torch.zeros_like(valid)
 
             if candidate_idx.numel() > 0:
@@ -219,7 +219,7 @@ class LogitFlip:
                 candidate_costs.append(entry["cost"].flatten()[idx])
 
         n_valid_total = sum(valid_counts)
-        budget = self.tau * n_valid_total
+        budget = self.tau # * n_valid_total
 
         if candidate_gains:
             chosen_global, spent = self._select(
