@@ -1,47 +1,56 @@
 """
-GridSAM: adversarial rounding flips under a per-parameter distance budget.
-No continuous-parameter perturbation -- flips only.
+GridSAM (gain-budgeted): adversarial rounding flips that raise the loss by a
+fixed predicted amount, as cheaply as possible. No continuous-parameter
+perturbation -- flips only.
 
-Inner problem:
+This is the DUAL of the distance-budgeted formulation:
 
-    max_S  sum_{i in S} gain_i     s.t.  sum_{i in S} m_i^2 <= tau * d_valid
+    distance budget:  max_S sum gain_i   s.t.  sum m_i^2 <= tau * d
+    gain budget:      min_S sum m_i^2    s.t.  sum gain_i  >= c     <-- here
+
+i.e. "the most plausible rounding perturbation that raises the loss by c",
+instead of "the most damaging perturbation within a given effort".
 
     gain_i = g_i * d_i                  (1st-order flip gain, d_i = +-step_i)
     m_i    = (1/2 - min(r_i, 1-r_i)) * step_i   (latent distance to boundary)
 
-tau is the AVERAGE SQUARED LATENT DISTANCE PER PARAMETER the adversary may
-spend. The budget is extensive (proportional to the number of flippable
-weights), so the same tau means the same intervention density regardless of
-network or layer size:
+Both problems have the SAME greedy solution ordering -- rank candidates by
+efficiency gain_i / m_i^2 -- only the stopping rule differs: fill until the
+accumulated GAIN reaches c (rather than until the accumulated cost reaches
+the distance budget).
 
-    scope="global": budget = tau * d_valid_total  (one shared pool; the
-                    adversary may concentrate flips in whichever layers are
-                    most efficient)
-    scope="local" : budget = tau * d_valid_layer  (each layer gets its own
-                    budget, proportional to its own size)
+Why a gain budget: gain has units of LOSS, so c ("raise the training loss by
+c nats") means the same thing across weight scales, bit-widths, clip values
+and architectures -- the deepest scale-freeness available here, since
+step and gradient magnitude cancel inside gain = g * step. Flip count then
+scales roughly as sqrt(d) (per-coordinate gradients shrink as the model
+grows), which matches the implicit scaling of standard SAM (dL = rho * ||g||).
 
-Cost is measured in weight-space units (step = 2*clip/n), deliberately:
-a coarser grid means the weight sits farther from its rounding boundary in
-absolute terms, so that flip genuinely requires more latent movement and is
-less likely to occur at deployment. Consequently the realized flip fraction
-adapts on its own -- fewer flips at low bit-width or large clip, more at high
-bit-width -- and it also anneals during training as weights settle away from
-their boundaries. That adaptation is the intended behaviour of a fixed tau,
-not a scale artifact: tau fixes the adversary's *effort*, and the number of
-flips that effort buys is a property of the current geometry.
+    scope="global": one shared budget c over the whole network (the adversary
+                    may concentrate wherever it is cheapest).
+    scope="local" : c is split across layers in proportion to layer size, so
+                    the totals of the two scopes are directly comparable.
 
-Solver: rank candidates (gain > 0) by efficiency gain_i / m_i^2 and fill
-until the budget is exhausted (greedy on the fractional-knapsack relaxation;
-each item's cost is tiny relative to the budget, so the gap is negligible).
+CAVEATS (read before tuning):
 
-Properties: tau -> 0  ->  nearest-rounding QAT baseline (no flips).
+  * gain is estimated from a minibatch, and we select the TOP of a noisy
+    ranking, so sum gain over the selected set is biased upward (winner's
+    curse). The realized loss increase can fall well short of c when the
+    gradient noise is comparable to the signal; the bias also drifts with
+    batch size and training stage. The distance budget does not have this
+    problem (m is deterministic). Consider ranking on one half of the batch
+    and accumulating gain on the other if this bites.
 
-m_floor_frac (default 0): optional lower bound m >= m_floor_frac * step. With
-a distance budget, coordinates sitting exactly on their boundary cost ~0 and
-are effectively free, so they can be selected in large numbers without
-consuming budget. Set a small value (e.g. 0.01) to cap that; leave at 0 to
-let oscillating weights be flipped freely (they are, after all, the ones that
-really do flip). free_frac is logged either way.
+  * unlike the distance budget, there is no crystallization-driven annealing:
+    as training converges gradients shrink, so MORE flips are needed to reach
+    the same c. Flip count tends to grow late in training. Watch flip_frac.
+
+  * near-boundary coordinates have cost ~ 0 and therefore huge efficiency,
+    but contribute almost nothing to the accumulated gain, so they are all
+    taken before the budget moves. Set m_floor_frac > 0 (e.g. 0.01) if flip
+    counts explode.
+
+Properties: c -> 0  ->  nearest-rounding QAT baseline (no flips).
 """
 
 from __future__ import annotations
@@ -55,15 +64,15 @@ from models.LIQ_wn_qsam import QConv2d, QLinear
 
 class GridSAM:
 
-    def __init__(self, optimizer, model, tau: float = 1e-4,
+    def __init__(self, optimizer, model, c: float = 1e-2,
                  scope: str = "global", mask_grid_exact: bool = True,
                  m_floor_frac: float = 0.0):
-        assert tau >= 0.0, tau
+        assert c >= 0.0, c
         assert scope in ("global", "local"), scope
         assert 0.0 <= m_floor_frac < 0.5, m_floor_frac
         self.optimizer = optimizer
         self.model = model
-        self.tau = float(tau)              # avg squared latent distance / param
+        self.c = float(c)                  # target 1st-order loss increase
         self.scope = scope
         self.mask_grid_exact = mask_grid_exact
         self.m_floor_frac = float(m_floor_frac)
@@ -99,7 +108,6 @@ class GridSAM:
 
         gain = g * delta_flip
 
-        # latent distance to the rounding boundary, in weight-space units
         m_dist = (0.5 - torch.minimum(r, 1.0 - r)) * step_out
         if self.m_floor_frac > 0.0:
             m_dist = torch.maximum(m_dist, self.m_floor_frac * step_out)
@@ -111,25 +119,26 @@ class GridSAM:
                 "n_valid": int(valid.sum().item())}
 
     # ------------------------------------------------------------------ #
-    # solver
+    # solver: same efficiency ordering, stop on accumulated GAIN
     # ------------------------------------------------------------------ #
 
     @staticmethod
     @torch.no_grad()
     def _greedy_fill(gain: torch.Tensor, cost: torch.Tensor,
-                     budget: float) -> Tuple[torch.Tensor, float]:
-        """Efficiency-ordered fill. Returns (bool mask, spent)."""
+                     c: float) -> Tuple[torch.Tensor, float, float, bool]:
+        """Returns (mask, accumulated gain, accumulated cost, saturated)."""
         sel = torch.zeros_like(gain, dtype=torch.bool)
-        if budget <= 0.0 or gain.numel() == 0:
-            return sel, 0.0
-        # zero-cost items rank first (inf) and consume no budget -- intended:
-        # a weight sitting on its boundary is free to flip.
+        if c <= 0.0 or gain.numel() == 0:
+            return sel, 0.0, 0.0, False
         ratio = gain / cost.clamp_min(torch.finfo(cost.dtype).tiny)
         order = torch.argsort(ratio, descending=True)
-        keep = torch.cumsum(cost[order], dim=0) <= budget
+        cum_gain = torch.cumsum(gain[order], dim=0)
+        keep = cum_gain <= c
         chosen = order[keep]
         sel[chosen] = True
-        return sel, float(cost[chosen].sum().item())
+        got = float(gain[chosen].sum().item())
+        return (sel, got, float(cost[chosen].sum().item()),
+                bool(keep.all()))          # saturated: never reached c
 
     @torch.no_grad()
     def _write_epsilon(self, e: dict, selected_flat: torch.Tensor) -> None:
@@ -166,42 +175,48 @@ class GridSAM:
 
         self.optimizer.zero_grad()
 
-    # ---- budget = tau * d_valid_layer, independently per layer ---- #
+    # ---- c split across layers in proportion to layer size ---- #
     @torch.no_grad()
     def _select_local(self, names, entries) -> None:
+        n_valid_total = max(sum(e["n_valid"] for e in entries), 1)
         total_flips, total_valid = 0, 0
-        total_spent, total_budget = 0.0, 0.0
+        total_gain, total_cost = 0.0, 0.0
+        n_sat = 0
         for name, e in zip(names, entries):
-            budget = self.tau * e["n_valid"]
+            c_layer = self.c * e["n_valid"] / n_valid_total
             idx = e["cand"].flatten().nonzero(as_tuple=True)[0]
             selected = torch.zeros(e["delta"].numel(), dtype=torch.bool,
                                    device=e["delta"].device)
-            spent = 0.0
+            got_gain = got_cost = 0.0
+            sat = False
             if idx.numel() > 0:
                 g = e["gain"].flatten()[idx]
-                c = e["cost"].flatten()[idx]
-                chosen, spent = self._greedy_fill(g, c, budget)
+                cst = e["cost"].flatten()[idx]
+                chosen, got_gain, got_cost, sat = self._greedy_fill(
+                    g, cst, c_layer)
                 selected[idx[chosen]] = True
             self._write_epsilon(e, selected)
             nf = int(selected.sum().item())
             total_flips += nf
             total_valid += e["n_valid"]
-            total_spent += spent
-            total_budget += budget
+            total_gain += got_gain
+            total_cost += got_cost
+            n_sat += int(sat)
             self.flip_stats[name] = {
                 "flips": nf, "n_valid": e["n_valid"],
                 "flip_frac_valid": nf / max(e["n_valid"], 1),
-                "budget": budget, "spent": spent,
-                "budget_utilization": spent / max(budget, 1e-30),
+                "c_layer": c_layer, "gain_spent": got_gain,
+                "cost_spent": got_cost, "saturated": sat,
             }
         self.flip_stats["__global__"] = {
             "flips": total_flips, "n_valid": total_valid,
             "flip_frac_valid": total_flips / max(total_valid, 1),
-            "tau": self.tau, "budget": total_budget, "spent": total_spent,
-            "budget_utilization": total_spent / max(total_budget, 1e-30),
+            "c": self.c, "gain_spent": total_gain, "cost_spent": total_cost,
+            "gain_utilization": total_gain / max(self.c, 1e-30),
+            "n_saturated_layers": n_sat,
         }
 
-    # ---- budget = tau * d_valid_total, one shared pool ---- #
+    # ---- one shared budget c over the whole network ---- #
     @torch.no_grad()
     def _select_global(self, names, entries) -> None:
         pool_g, pool_c, pool_layer, pool_pos = [], [], [], []
@@ -214,16 +229,16 @@ class GridSAM:
                 pool_pos.append(idx)
 
         n_valid_total = sum(e["n_valid"] for e in entries)
-        budget = self.tau * n_valid_total
 
         chosen_layer = chosen_pos = None
-        spent = 0.0
+        got_gain = got_cost = 0.0
+        sat = False
         if pool_g:
             G = torch.cat(pool_g)
             C = torch.cat(pool_c)
             Lyr = torch.cat(pool_layer)
             Pos = torch.cat(pool_pos)
-            chosen, spent = self._greedy_fill(G, C, budget)
+            chosen, got_gain, got_cost, sat = self._greedy_fill(G, C, self.c)
             chosen_layer = Lyr[chosen]
             chosen_pos = Pos[chosen]
 
@@ -245,8 +260,9 @@ class GridSAM:
         self.flip_stats["__global__"] = {
             "flips": total_flips, "n_valid": n_valid_total,
             "flip_frac_valid": total_flips / max(n_valid_total, 1),
-            "tau": self.tau, "budget": budget, "spent": spent,
-            "budget_utilization": spent / max(budget, 1e-30),
+            "c": self.c, "gain_spent": got_gain, "cost_spent": got_cost,
+            "gain_utilization": got_gain / max(self.c, 1e-30),
+            "saturated": sat,
         }
 
     # ------------------------------------------------------------------ #

@@ -54,7 +54,7 @@ def get_minimizer(model, optimizer, args):
         minimizer = gridsam.GridSAM(
             optimizer,
             model,
-            tau=args.tau,
+            c=args.gain_budget,
             scope=args.kappa_mode,
             m_floor_frac=args.m_floor_frac,
         )
