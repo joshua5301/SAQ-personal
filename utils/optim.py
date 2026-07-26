@@ -54,8 +54,8 @@ def get_minimizer(model, optimizer, args):
         minimizer = gridsam.GridSAM(
             optimizer,
             model,
-            c=args.gain_budget,
-            scope=args.kappa_mode,
+            rho=args.rho,
+            perturb_continuous=args.perturb_continuous,
             m_floor_frac=args.m_floor_frac,
         )
     elif "LogitFlip" in args.opt_type:

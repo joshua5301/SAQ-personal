@@ -1,96 +1,84 @@
 """
-GridSAM (gain-budgeted): adversarial rounding flips that raise the loss by a
-fixed predicted amount, as cheaply as possible. No continuous-parameter
-perturbation -- flips only.
+Latent-Boundary GridSAM: constrained SAM with a single fixed radius rho
+shared between rounding flips and continuous-parameter perturbation.
 
-This is the DUAL of the distance-budgeted formulation:
+Inner problem (constraint form; exact SAM reduction when no flips):
 
-    distance budget:  max_S sum gain_i   s.t.  sum m_i^2 <= tau * d
-    gain budget:      min_S sum m_i^2    s.t.  sum gain_i  >= c     <-- here
+    max_{S, e}  sum_{i in S} gain_i  +  g_c^T e
+    s.t.        sum_{i in S} m_i^2  +  ||e||_2^2  <=  rho^2
 
-i.e. "the most plausible rounding perturbation that raises the loss by c",
-instead of "the most damaging perturbation within a given effort".
+where, per quantized coordinate i,
+    gain_i = g_i * d_i          (1st-order flip gain, d_i = +-step_i)
+    m_i    = latent distance to the rounding boundary, in output units
+             = (1/2 - min(r_i, 1 - r_i)) * step_i
+and e is the perturbation of the continuous parameters (clip / bias / BN).
 
-    gain_i = g_i * d_i                  (1st-order flip gain, d_i = +-step_i)
-    m_i    = (1/2 - min(r_i, 1-r_i)) * step_i   (latent distance to boundary)
+Solution structure (concave in the spent budget):
+    - candidates (valid, gain > 0) are sorted globally by ratio gain / m^2
+    - for every prefix k:  Phi(k) = G_k + ||g_c|| * sqrt(rho^2 - C_k)
+    - S* = argmax-prefix;  remaining radius rho_c = sqrt(rho^2 - C*)
+      is spent on a standard (normalized) SAM step for continuous params:
+          e = rho_c * g_c / ||g_c||
 
-Both problems have the SAME greedy solution ordering -- rank candidates by
-efficiency gain_i / m_i^2 -- only the stopping rule differs: fill until the
-accumulated GAIN reaches c (rather than until the accumulated cost reaches
-the distance budget).
+Properties:
+    - no quantized flips selected  ->  exactly standard SAM with radius rho
+    - rho -> 0                     ->  nearest-rounding baseline
+    - rho is a genuine fixed L2 radius, inherited verbatim from SAQ
 
-Why a gain budget: gain has units of LOSS, so c ("raise the training loss by
-c nats") means the same thing across weight scales, bit-widths, clip values
-and architectures -- the deepest scale-freeness available here, since
-step and gradient magnitude cancel inside gain = g * step. Flip count then
-scales roughly as sqrt(d) (per-coordinate gradients shrink as the model
-grows), which matches the implicit scaling of standard SAM (dL = rho * ||g||).
+Design constants (not knobs):
+    - m^2 floor: m_i^2 >= (M_FLOOR_FRAC * step_i)^2, preventing
+      boundary-sitting (oscillating) coordinates from consuming the
+      budget for free with vanishing cost.
 
-    scope="global": one shared budget c over the whole network (the adversary
-                    may concentrate wherever it is cheapest).
-    scope="local" : c is split across layers in proportion to layer size, so
-                    the totals of the two scopes are directly comparable.
-
-CAVEATS (read before tuning):
-
-  * gain is estimated from a minibatch, and we select the TOP of a noisy
-    ranking, so sum gain over the selected set is biased upward (winner's
-    curse). The realized loss increase can fall well short of c when the
-    gradient noise is comparable to the signal; the bias also drifts with
-    batch size and training stage. The distance budget does not have this
-    problem (m is deterministic). Consider ranking on one half of the batch
-    and accumulating gain on the other if this bites.
-
-  * unlike the distance budget, there is no crystallization-driven annealing:
-    as training converges gradients shrink, so MORE flips are needed to reach
-    the same c. Flip count tends to grow late in training. Watch flip_frac.
-
-  * near-boundary coordinates have cost ~ 0 and therefore huge efficiency,
-    but contribute almost nothing to the accumulated gain, so they are all
-    taken before the budget moves. Set m_floor_frac > 0 (e.g. 0.01) if flip
-    counts explode.
-
-Properties: c -> 0  ->  nearest-rounding QAT baseline (no flips).
+Implementation note: flips are realized through the epsilon hook
+(m.epsilon = +-step on selected coords), i.e. the second pass evaluates
+Q(w) + eps via quantize_weight_add_epsilon. Under LIQ_wn this coincides
+with actually moving the latent weight across its boundary up to the
+tiny mean/std re-normalization side effect; the epsilon path is used
+because it is exact in the cached geometry's domain and reuses the
+battle-tested set_second_forward machinery.
 """
 
-from __future__ import annotations
-
-from typing import Dict, List, Optional, Tuple
-
 import torch
-
 from models.LIQ_wn_qsam import QConv2d, QLinear
+from utils.cont_perturb import CONT_MODES, gather_cont_params
 
 
 class GridSAM:
 
-    def __init__(self, optimizer, model, c: float = 1e-2,
-                 scope: str = "global", mask_grid_exact: bool = True,
-                 m_floor_frac: float = 0.0):
-        assert c >= 0.0, c
-        assert scope in ("global", "local"), scope
+    def __init__(self, optimizer, model, rho=0.05,
+                 perturb_continuous="qsam_default", mask_grid_exact=True,
+                 m_floor_frac=0.01):
+        assert perturb_continuous in CONT_MODES, perturb_continuous
         assert 0.0 <= m_floor_frac < 0.5, m_floor_frac
         self.optimizer = optimizer
         self.model = model
-        self.c = float(c)                  # target 1st-order loss increase
-        self.scope = scope
+        self.rho = rho
+        self.perturb_continuous = perturb_continuous
         self.mask_grid_exact = mask_grid_exact
         self.m_floor_frac = float(m_floor_frac)
-        self.flip_stats: Dict[str, dict] = {}
+        self._backups = {}   # {param: saved data}; restore iterates this
+        self._stats = {}     # tensors only; materialized via stats()
 
-    def _is_quantized(self, m) -> bool:
+    # ------------------------------------------------------------------ #
+    # helpers
+    # ------------------------------------------------------------------ #
+
+    def _is_quantized(self, m):
         return isinstance(m, (QConv2d, QLinear)) and m.bits_weights != 32
 
-    # ------------------------------------------------------------------ #
-    # geometry
-    # ------------------------------------------------------------------ #
-
     @torch.no_grad()
-    def _geometry(self, module) -> Optional[dict]:
-        g = module.x.grad
+    def _layer_candidates(self, m):
+        """
+        Returns (gain, delta_flip, m_sq, cand) for one quantized layer,
+        or None if grad / cache is unavailable.
+          cand: mask of flip candidates (valid & gain > 0)
+          m_sq: floored squared latent boundary distance (output units)
+        """
+        g = m.x.grad
         if g is None:
             return None
-        cache = getattr(module, "rounding_cache", None)
+        cache = getattr(m, "rounding_cache", None)
         if cache is None:
             raise RuntimeError(
                 "[GridSAM] rounding_cache missing. "
@@ -99,7 +87,8 @@ class GridSAM:
         r, nearest_is_floor, floor_lvl, n, step_out = cache
 
         dir_sign = torch.where(
-            nearest_is_floor, torch.ones_like(r), -torch.ones_like(r))
+            nearest_is_floor, torch.ones_like(r), -torch.ones_like(r)
+        )
         delta_flip = dir_sign * step_out
 
         valid = ~(nearest_is_floor & (floor_lvl >= n))
@@ -114,177 +103,133 @@ class GridSAM:
         m_sq = m_dist.square()
 
         cand = valid & (gain > 0)
-        return {"module": module, "delta": delta_flip,
-                "gain": gain, "cost": m_sq, "cand": cand,
-                "n_valid": int(valid.sum().item())}
-
-    # ------------------------------------------------------------------ #
-    # solver: same efficiency ordering, stop on accumulated GAIN
-    # ------------------------------------------------------------------ #
-
-    @staticmethod
-    @torch.no_grad()
-    def _greedy_fill(gain: torch.Tensor, cost: torch.Tensor,
-                     c: float) -> Tuple[torch.Tensor, float, float, bool]:
-        """Returns (mask, accumulated gain, accumulated cost, saturated)."""
-        sel = torch.zeros_like(gain, dtype=torch.bool)
-        if c <= 0.0 or gain.numel() == 0:
-            return sel, 0.0, 0.0, False
-        ratio = gain / cost.clamp_min(torch.finfo(cost.dtype).tiny)
-        order = torch.argsort(ratio, descending=True)
-        cum_gain = torch.cumsum(gain[order], dim=0)
-        keep = cum_gain <= c
-        chosen = order[keep]
-        sel[chosen] = True
-        got = float(gain[chosen].sum().item())
-        return (sel, got, float(cost[chosen].sum().item()),
-                bool(keep.all()))          # saturated: never reached c
-
-    @torch.no_grad()
-    def _write_epsilon(self, e: dict, selected_flat: torch.Tensor) -> None:
-        mask = selected_flat.view_as(e["delta"])
-        e["module"].epsilon = mask.to(e["delta"].dtype) * e["delta"]
+        return gain, delta_flip, m_sq, cand
 
     # ------------------------------------------------------------------ #
     # SAM interface (engine.py calls these)
     # ------------------------------------------------------------------ #
 
     @torch.no_grad()
-    def ascent_step(self) -> None:
-        self.flip_stats = {}
+    def ascent_step(self):
+        self._backups.clear()
+        rho_sq = self.rho * self.rho
 
-        entries: List[dict] = []
-        names: List[str] = []
-        for name, m in self.model.named_modules():
-            if not self._is_quantized(m):
+        # ---- pass 1: gather candidates across all quantized layers ----
+        layers = []                # (m, delta_flip, cand, d)
+        pool_gain, pool_cost = [], []
+        pool_layer, pool_pos = [], []
+        for lid, (name, m) in enumerate(
+                (n_, m_) for n_, m_ in self.model.named_modules()
+                if self._is_quantized(m_)):
+            res = self._layer_candidates(m)
+            if res is None:
                 continue
-            e = self._geometry(m)
-            if e is None:
-                continue
-            entries.append(e)
-            names.append(name)
-
-        if not entries:
-            self.optimizer.zero_grad()
-            return
-
-        if self.scope == "local":
-            self._select_local(names, entries)
-        else:
-            self._select_global(names, entries)
-
-        self.optimizer.zero_grad()
-
-    # ---- c split across layers in proportion to layer size ---- #
-    @torch.no_grad()
-    def _select_local(self, names, entries) -> None:
-        n_valid_total = max(sum(e["n_valid"] for e in entries), 1)
-        total_flips, total_valid = 0, 0
-        total_gain, total_cost = 0.0, 0.0
-        n_sat = 0
-        for name, e in zip(names, entries):
-            c_layer = self.c * e["n_valid"] / n_valid_total
-            idx = e["cand"].flatten().nonzero(as_tuple=True)[0]
-            selected = torch.zeros(e["delta"].numel(), dtype=torch.bool,
-                                   device=e["delta"].device)
-            got_gain = got_cost = 0.0
-            sat = False
+            gain, delta_flip, m_sq, cand = res
+            layers.append((m, delta_flip, cand))
+            idx = cand.flatten().nonzero(as_tuple=True)[0]
             if idx.numel() > 0:
-                g = e["gain"].flatten()[idx]
-                cst = e["cost"].flatten()[idx]
-                chosen, got_gain, got_cost, sat = self._greedy_fill(
-                    g, cst, c_layer)
-                selected[idx[chosen]] = True
-            self._write_epsilon(e, selected)
-            nf = int(selected.sum().item())
-            total_flips += nf
-            total_valid += e["n_valid"]
-            total_gain += got_gain
-            total_cost += got_cost
-            n_sat += int(sat)
-            self.flip_stats[name] = {
-                "flips": nf, "n_valid": e["n_valid"],
-                "flip_frac_valid": nf / max(e["n_valid"], 1),
-                "c_layer": c_layer, "gain_spent": got_gain,
-                "cost_spent": got_cost, "saturated": sat,
-            }
-        self.flip_stats["__global__"] = {
-            "flips": total_flips, "n_valid": total_valid,
-            "flip_frac_valid": total_flips / max(total_valid, 1),
-            "c": self.c, "gain_spent": total_gain, "cost_spent": total_cost,
-            "gain_utilization": total_gain / max(self.c, 1e-30),
-            "n_saturated_layers": n_sat,
-        }
-
-    # ---- one shared budget c over the whole network ---- #
-    @torch.no_grad()
-    def _select_global(self, names, entries) -> None:
-        pool_g, pool_c, pool_layer, pool_pos = [], [], [], []
-        for lid, e in enumerate(entries):
-            idx = e["cand"].flatten().nonzero(as_tuple=True)[0]
-            if idx.numel() > 0:
-                pool_g.append(e["gain"].flatten()[idx])
-                pool_c.append(e["cost"].flatten()[idx])
-                pool_layer.append(torch.full_like(idx, lid))
+                pool_gain.append(gain.flatten()[idx])
+                pool_cost.append(m_sq.flatten()[idx])
+                pool_layer.append(torch.full_like(idx, len(layers) - 1))
                 pool_pos.append(idx)
 
-        n_valid_total = sum(e["n_valid"] for e in entries)
+        # ---- continuous gradient norm (for the sqrt term) ----
+        cont_params = [p for p in
+                       gather_cont_params(self.model, self.perturb_continuous)
+                       if p.grad is not None]
+        if cont_params:
+            gc_norm = torch.norm(torch.stack(
+                [p.grad.norm(p=2) for p in cont_params]), p=2)
+        else:
+            gc_norm = None
 
-        chosen_layer = chosen_pos = None
-        got_gain = got_cost = 0.0
-        sat = False
-        if pool_g:
-            G = torch.cat(pool_g)
-            C = torch.cat(pool_c)
-            Lyr = torch.cat(pool_layer)
-            Pos = torch.cat(pool_pos)
-            chosen, got_gain, got_cost, sat = self._greedy_fill(G, C, self.c)
-            chosen_layer = Lyr[chosen]
-            chosen_pos = Pos[chosen]
+        # ---- solver: global argmax-prefix by ratio = gain / m^2 ----
+        n_flip = 0
+        spent = None
+        if pool_gain:
+            G = torch.cat(pool_gain)
+            C = torch.cat(pool_cost)
+            L = torch.cat(pool_layer)
+            P = torch.cat(pool_pos)
 
-        total_flips = 0
-        for lid, (name, e) in enumerate(zip(names, entries)):
-            selected = torch.zeros(e["delta"].numel(), dtype=torch.bool,
-                                   device=e["delta"].device)
-            if chosen_pos is not None:
-                here = chosen_pos[chosen_layer == lid]
-                if here.numel() > 0:
-                    selected[here] = True
-            self._write_epsilon(e, selected)
-            nf = int(selected.sum().item())
-            total_flips += nf
-            self.flip_stats[name] = {
-                "flips": nf, "n_valid": e["n_valid"],
-                "flip_frac_valid": nf / max(e["n_valid"], 1),
-            }
-        self.flip_stats["__global__"] = {
-            "flips": total_flips, "n_valid": n_valid_total,
-            "flip_frac_valid": total_flips / max(n_valid_total, 1),
-            "c": self.c, "gain_spent": got_gain, "cost_spent": got_cost,
-            "gain_utilization": got_gain / max(self.c, 1e-30),
-            "saturated": sat,
+            order = torch.argsort(G / C, descending=True)
+            cum_g = G[order].cumsum(0)
+            cum_c = C[order].cumsum(0)
+            feasible = cum_c <= rho_sq
+
+            # Phi(k) for prefixes k = 0..K (k = 0: pure SAM)
+            zero = torch.zeros((), device=G.device, dtype=G.dtype)
+            resid = (rho_sq - cum_c).clamp_min(0.0).sqrt()
+            if gc_norm is not None:
+                phi = cum_g + gc_norm * resid
+                phi0 = gc_norm * self.rho + zero
+            else:
+                phi = cum_g
+                phi0 = zero
+            phi = torch.where(feasible, phi,
+                              torch.full_like(phi, torch.finfo(phi.dtype).min))
+            best = int(torch.argmax(torch.cat([phi0.reshape(1), phi])))
+
+            if best > 0:
+                chosen = order[:best]
+                n_flip = best
+                spent = cum_c[best - 1]
+                # scatter chosen candidates back to per-layer epsilon
+                ch_layer = L[chosen]
+                ch_pos = P[chosen]
+                for lid, (m, delta_flip, cand) in enumerate(layers):
+                    sel = ch_pos[ch_layer == lid]
+                    mask = torch.zeros(delta_flip.numel(), dtype=torch.bool,
+                                       device=delta_flip.device)
+                    if sel.numel() > 0:
+                        mask[sel] = True
+                    m.epsilon = (mask.view_as(delta_flip)
+                                 .to(delta_flip.dtype) * delta_flip)
+            else:
+                for m, delta_flip, _ in layers:
+                    m.epsilon = torch.zeros_like(delta_flip)
+        else:
+            for m, delta_flip, _ in layers:
+                m.epsilon = torch.zeros_like(delta_flip)
+
+        dev = (cont_params[0].device if cont_params
+               else (layers[0][1].device if layers else "cpu"))
+        if spent is None:
+            spent = torch.zeros((), device=dev)
+
+        # ---- continuous params: standard SAM with the REMAINING radius ----
+        rho_c = (rho_sq - spent).clamp_min(0.0).sqrt()
+        if cont_params and gc_norm is not None and gc_norm > 1e-12:
+            scale = rho_c / gc_norm
+            for p in cont_params:
+                self._backups[p] = p.data.clone()
+                p.add_(p.grad * scale)
+
+        self._stats = {
+            "n_flip": torch.as_tensor(n_flip),
+            "budget_spent_frac": spent / max(rho_sq, 1e-24),
+            "rho_c": rho_c,
         }
 
-    # ------------------------------------------------------------------ #
+    @torch.no_grad()
+    def stats(self):
+        """Materialize diagnostics (one sync). Call every N steps."""
+        return {k: (float(v) if torch.is_tensor(v) else v)
+                for k, v in self._stats.items()}
 
     @torch.no_grad()
-    def _clear_rounding_eps(self) -> None:
-        for m in self.model.modules():
-            if not self._is_quantized(m):
-                continue
-            eps = getattr(m, "epsilon", None)
-            if torch.is_tensor(eps):
-                m.epsilon = torch.zeros_like(eps)
-            elif hasattr(m, "epsilon"):
-                m.epsilon = None
+    def _restore(self):
+        for p, data in self._backups.items():
+            p.data = data
+        self._backups.clear()
 
     @torch.no_grad()
-    def descent_step(self) -> None:
-        self._clear_rounding_eps()
+    def descent_step(self):
+        self._restore()
         self.optimizer.step()
         self.optimizer.zero_grad()
 
     @torch.no_grad()
-    def restore_step(self) -> None:
-        self._clear_rounding_eps()
+    def restore_step(self):
+        self._restore()
         self.optimizer.zero_grad()

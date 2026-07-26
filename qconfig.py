@@ -35,10 +35,10 @@ def get_qparser():
                     choices=["output", "latent"],
                     help="GridUSAM flip-cost space: output (|delta|) or "
                          "latent (distance to rounding boundary)")
-    parser.add_argument("--m_floor_frac", type=float, default=0.0,
+    parser.add_argument("--m_floor_frac", type=float, default=0.01,
                     help="GridSAM: lower bound m >= m_floor_frac * step on "
-                         "the boundary-distance cost (0 = disabled; ~0.01 to "
-                         "cap free flips of boundary-sitting weights)")
+                         "the boundary-distance cost (0 = disabled; default "
+                         "0.01 caps free flips of boundary-sitting weights)")
     parser.add_argument("--gain_budget", type=float, default=1e-2,
                     help="GridSAM: target 1st-order loss increase c "
                          "(nats). c -> 0 = nearest-QAT baseline.")
