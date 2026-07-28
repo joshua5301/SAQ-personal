@@ -63,9 +63,10 @@ def get_qparser():
                     choices=["local", "global"],
                     help="FlipSAM flip budget: per-layer (local) or network-wide (global)")
     parser.add_argument("--perturb_continuous", type=str, default="none",
-        choices=["none", "clip", "clip_bias", "all", "qsam_default"],
+        choices=["none", "clip", "clip_bias", "all", "qsam_default", "bn_only"],
         help="continuous-param perturbation scope for FlipSAM/FlipQSAM/TiltedSR; "
-             "qsam_default = aclip+bias+BN (the QSAM baseline's default scope)",
+             "qsam_default = aclip+bias+BN (the QSAM baseline's default scope); "
+             "bn_only = BatchNorm2d affine only (SAM-ON style)",
     )
     parser.add_argument("--cont_radius", type=str, default="induced",
         choices=["induced", "qsam"],
