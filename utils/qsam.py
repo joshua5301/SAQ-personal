@@ -15,6 +15,7 @@ class QSAM:
         include_aclip=False,
         include_bn=True,
         include_bias=True,
+        include_qweight=True,
     ):
         self.optimizer = optimizer
         self.model = model
@@ -23,6 +24,7 @@ class QSAM:
         self.include_aclip = include_aclip
         self.include_bn = include_bn
         self.include_bias = include_bias
+        self.include_qweight = include_qweight
         self.state = defaultdict(dict)
 
     @torch.no_grad()
@@ -32,7 +34,8 @@ class QSAM:
         wgrads = []
         for n, m in self.model.named_modules():
             if isinstance(m, (QConv2d, QLinear)):
-                wgrads.append(torch.norm(m.x.grad, p=2).to(shared_device))
+                if self.include_qweight:
+                    wgrads.append(torch.norm(m.x.grad, p=2).to(shared_device))
 
                 if self.include_wclip:
                     wgrads.append(
@@ -60,10 +63,15 @@ class QSAM:
         scale = self.rho / (grad_norm + 1e-12)
         for n, m in self.model.named_modules():
             if isinstance(m, (QConv2d, QLinear)):
-                p = m.x
-                self.state[m]["old_p"] = p.data.clone()
-                e_w = p.grad * scale.to(p)
-                m.epsilon = e_w
+                if self.include_qweight:
+                    p = m.x
+                    self.state[m]["old_p"] = p.data.clone()
+                    e_w = p.grad * scale.to(p)
+                    m.epsilon = e_w
+                else:
+                    # second forward expects a valid epsilon tensor even
+                    # when the quantized weight is not being perturbed
+                    m.epsilon = torch.zeros_like(m.x)
 
                 if self.include_wclip:
                     p = m.weight_clip_value
