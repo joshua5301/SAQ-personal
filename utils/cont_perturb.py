@@ -14,16 +14,21 @@ import torch.nn as nn
 
 from models.LIQ_wn_qsam import QConv2d, QLinear
 
-CONT_MODES = ("none", "clip", "clip_bias", "all", "qsam_default")
+CONT_MODES = ("none", "clip", "clip_bias", "all", "qsam_default", "bn_only")
 
 
 def gather_cont_params(model, mode):
     """Continuous parameters to perturb under the given scope, in module
-    order. Only params that currently hold a gradient are returned."""
+    order. Only params that currently hold a gradient are returned.
+
+    "bn_only" restricts perturbation to BatchNorm2d affine params (gamma,
+    beta) — SAM-ON style. Combine with flip-based minimizers (GridSAM,
+    KLTilt, ...) to get "adversarial rounding + BN-only continuous SAM".
+    """
     assert mode in CONT_MODES, mode
     params = []
     for _, m in model.named_modules():
-        if isinstance(m, (QConv2d, QLinear)):
+        if isinstance(m, (QConv2d, QLinear)) and mode != "bn_only":
             cands = []
             if mode in ("clip", "clip_bias", "all"):
                 cands += [getattr(m, "weight_clip_value", None),
@@ -35,7 +40,7 @@ def gather_cont_params(model, mode):
             for p in cands:
                 if p is not None and p.grad is not None:
                     params.append(p)
-        if mode in ("all", "qsam_default") and \
+        if mode in ("all", "qsam_default", "bn_only") and \
                 isinstance(m, nn.BatchNorm2d) and m.weight is not None:
             for p in (m.weight, m.bias):
                 if p.grad is not None:
