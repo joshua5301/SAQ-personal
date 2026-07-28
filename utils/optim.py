@@ -13,6 +13,7 @@ import utils.logitflip as logitflip
 import utils.gridusam as gridusam
 import utils.gridsam as gridsam
 import utils.gridsam_old as gridsam_old
+import utils.efficientgridsam as efficientgridsam
 import utils.klsam as klsam
 import utils.AdvQuant as advquant
 
@@ -34,6 +35,15 @@ def get_minimizer(model, optimizer, args):
             deterministic=args.deterministic,
             perturb_continuous=args.perturb_continuous,
             rho=args.rho,
+        )
+    elif "EfficientGridSAM" in args.opt_type:
+        minimizer = efficientgridsam.EfficientGridSAM(
+            optimizer,
+            model,
+            rho=args.rho,
+            perturb_continuous=args.perturb_continuous,
+            m_floor_frac=args.m_floor_frac,
+            last_n_layers=args.last_n_layers,
         )
     elif "GridUSAM" in args.opt_type:
         minimizer = gridusam.GridUSAM(

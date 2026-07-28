@@ -39,6 +39,11 @@ def get_qparser():
                     help="GridSAM: lower bound m >= m_floor_frac * step on "
                          "the boundary-distance cost (0 = disabled; default "
                          "0.01 caps free flips of boundary-sitting weights)")
+    parser.add_argument("--last_n_layers", type=int, default=3,
+                    help="EfficientGridSAM: number of trailing quantized "
+                         "layers eligible for flips (1 = last conv/linear "
+                         "only; ~3 covers a typical MBv2 inverted-residual "
+                         "tail; large N -> GridSAM)")
     parser.add_argument("--gain_budget", type=float, default=1e-2,
                     help="GridSAM: target 1st-order loss increase c "
                          "(nats). c -> 0 = nearest-QAT baseline.")
