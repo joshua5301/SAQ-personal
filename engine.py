@@ -195,6 +195,8 @@ def train(
                 for weight_eps_name in weight_eps_names:
                     if hasattr(module, weight_eps_name):
                         eps = getattr(module, weight_eps_name)
+                        if eps is None:
+                            continue
                         if eps.numel() == 1:
                             tensorboard_logger.add_scalar(
                                 "{}_{}".format(name, weight_eps_name), eps, epoch,
@@ -207,6 +209,8 @@ def train(
                 for bn_eps_name in bn_eps_names:
                     if hasattr(module, bn_eps_name):
                         eps = getattr(module, bn_eps_name)
+                        if eps is None:
+                            continue
                         if eps.numel() == 1:
                             tensorboard_logger.add_scalar(
                                 "{}_{}".format(name, weight_eps_name), eps, epoch,
