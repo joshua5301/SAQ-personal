@@ -44,6 +44,22 @@ def get_qparser():
                          "layers eligible for flips (1 = last conv/linear "
                          "only; ~3 covers a typical MBv2 inverted-residual "
                          "tail; large N -> GridSAM)")
+    parser.add_argument("--varreg_lambda", type=float, default=0.0,
+                    help="VarReg: final-epoch lambda (0 = off; the ONLY "
+                         "hyperparameter, other schedules end here too)")
+    parser.add_argument("--varreg_measure", type=str, default="sr",
+                    choices=["sr", "gauss"],
+                    help="VarReg: variance arm. sr = r(1-r); gauss = "
+                         "two-boundary truncation at alpha=0.12")
+    parser.add_argument("--varreg_schedule", type=str, default="cosine",
+                    choices=["constant", "linear", "cosine"],
+                    help="VarReg: lambda(epoch) shape, all end at "
+                         "varreg_lambda")
+    parser.add_argument("--varreg_apply", type=str, default="auto",
+                    choices=["auto", "coupled", "decoupled"],
+                    help="VarReg: coupled = add to grad (SGD); decoupled "
+                         "= AdamW-style post-step update; auto picks by "
+                         "optimizer class")
     parser.add_argument("--gain_budget", type=float, default=1e-2,
                     help="GridSAM: target 1st-order loss increase c "
                          "(nats). c -> 0 = nearest-QAT baseline.")

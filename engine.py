@@ -67,52 +67,69 @@ def train(
         start_time = time.time()
         image, target = image.to(device), target.to(device)
 
-        # Ascent Step
-        model.require_backward_grad_sync = False
-        model.require_forward_param_sync = True
-        enable_running_stats(model)
-        output = model(image)
-        loss = criterion(output, target)
-        loss.backward()
-        minimizer.ascent_step()
+        if "VarReg" in args.opt_type:
+            # Single-pass regularizer: ordinary train step, then gradient/
+            # weight patch after backward. No BN dance, no second forward.
+            model.require_backward_grad_sync = True
+            model.require_forward_param_sync = True
+            enable_running_stats(model)
+            minimizer.arm()
+            output = model(image)
+            loss = criterion(output, target)
+            optimizer.zero_grad()
+            loss.backward()
+            minimizer.stage()
+            minimizer.commit()
+            optimizer.step()
+            minimizer.apply(lr=optimizer.param_groups[0]["lr"])
+            minimizer.clear()
+        else:
+            # Ascent Step
+            model.require_backward_grad_sync = False
+            model.require_forward_param_sync = True
+            enable_running_stats(model)
+            output = model(image)
+            loss = criterion(output, target)
+            loss.backward()
+            minimizer.ascent_step()
 
-        # descent step
-        model.require_backward_grad_sync = True
-        model.require_forward_param_sync = False
-        if (
-            "QSAM" in args.opt_type
-            or "QASAM" in args.opt_type
-            or "FlipSAM" in args.opt_type
-            or "FlipQSAM" in args.opt_type
-            or "TiltedSR" in args.opt_type
-            or "KLTilt" in args.opt_type
-            or "LogitFlip" in args.opt_type
-            or "GridUSAM" in args.opt_type
-            or "GridSAM" in args.opt_type
-            or "KLSAM" in args.opt_type
-            or "AdvQuant" in args.opt_type
-            or "EfficientGridSAM" in args.opt_type
-        ):
-            set_second_forward(model)
-        disable_running_stats(model)
-        criterion(model(image), target).backward()
-        # torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        minimizer.descent_step()
-        if (
-            "QSAM" in args.opt_type
-            or "QASAM" in args.opt_type
-            or "FlipSAM" in args.opt_type
-            or "FlipQSAM" in args.opt_type
-            or "TiltedSR" in args.opt_type
-            or "KLTilt" in args.opt_type
-            or "LogitFlip" in args.opt_type
-            or "GridUSAM" in args.opt_type
-            or "GridSAM" in args.opt_type
-            or "KLSAM" in args.opt_type
-            or "AdvQuant" in args.opt_type
-            or "EfficientGridSAM" in args.opt_type
-        ):
-            set_first_forward(model)
+            # descent step
+            model.require_backward_grad_sync = True
+            model.require_forward_param_sync = False
+            if (
+                "QSAM" in args.opt_type
+                or "QASAM" in args.opt_type
+                or "FlipSAM" in args.opt_type
+                or "FlipQSAM" in args.opt_type
+                or "TiltedSR" in args.opt_type
+                or "KLTilt" in args.opt_type
+                or "LogitFlip" in args.opt_type
+                or "GridUSAM" in args.opt_type
+                or "GridSAM" in args.opt_type
+                or "KLSAM" in args.opt_type
+                or "AdvQuant" in args.opt_type
+                or "EfficientGridSAM" in args.opt_type
+            ):
+                set_second_forward(model)
+            disable_running_stats(model)
+            criterion(model(image), target).backward()
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            minimizer.descent_step()
+            if (
+                "QSAM" in args.opt_type
+                or "QASAM" in args.opt_type
+                or "FlipSAM" in args.opt_type
+                or "FlipQSAM" in args.opt_type
+                or "TiltedSR" in args.opt_type
+                or "KLTilt" in args.opt_type
+                or "LogitFlip" in args.opt_type
+                or "GridUSAM" in args.opt_type
+                or "GridSAM" in args.opt_type
+                or "KLSAM" in args.opt_type
+                or "AdvQuant" in args.opt_type
+                or "EfficientGridSAM" in args.opt_type
+            ):
+                set_first_forward(model)
 
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
         batch_size = image.shape[0]

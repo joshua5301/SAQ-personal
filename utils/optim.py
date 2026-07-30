@@ -16,10 +16,20 @@ import utils.gridsam_old as gridsam_old
 import utils.efficientgridsam as efficientgridsam
 import utils.klsam as klsam
 import utils.AdvQuant as advquant
+import utils.varreg as varreg
 
 
 def get_minimizer(model, optimizer, args):
-    if "AdvQuant" in args.opt_type:
+    if "VarReg" in args.opt_type:
+        minimizer = varreg.VarReg(
+            model, optimizer,
+            lambda_final=args.varreg_lambda,
+            measure=args.varreg_measure,
+            schedule=args.varreg_schedule,
+            apply_mode=args.varreg_apply,
+            total_epochs=args.n_epochs,
+        )
+    elif "AdvQuant" in args.opt_type:
         minimizer = advquant.AdvQuant(
             optimizer,
             model,
